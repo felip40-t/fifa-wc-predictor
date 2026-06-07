@@ -1,0 +1,10 @@
+data/raw/
+data/processed/
+notebooks/
+__pycache__/
+*.pyc
+.env
+dist/
+*.egg-info/
+.venv/
+.claude/
