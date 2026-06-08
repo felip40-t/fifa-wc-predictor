@@ -19,7 +19,11 @@ def simulate_match(scoreline_matrix: np.ndarray, rng: np.random.Generator) -> tu
     Returns:
         A tuple of (home_goals, away_goals) sampled for the match.
     """
-    raise NotImplementedError
+    flat = scoreline_matrix.ravel()
+    probabilities = flat / flat.sum()
+    index = rng.choice(flat.size, p=probabilities)
+    home_goals, away_goals = np.unravel_index(index, scoreline_matrix.shape)
+    return int(home_goals), int(away_goals)
 
 
 def simulate_tournament(
