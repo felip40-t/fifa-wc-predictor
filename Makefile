@@ -1,4 +1,4 @@
-.PHONY: install test smoke lint format clean data
+.PHONY: install test smoke lint format clean data odds
 
 install:
 	pip install -e ".[dev]"
@@ -21,3 +21,6 @@ clean:
 
 data:
 	python -m fifa_predictor.data.fetch_results
+
+odds:
+	python -m fifa_predictor.data.fetch_odds

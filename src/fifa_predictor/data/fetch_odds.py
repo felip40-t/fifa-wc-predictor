@@ -1,12 +1,16 @@
 """Fetches bookmaker odds for upcoming and historical international matches."""
 
 import os
+import sys
+from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from fifa_predictor.model import vig_removal
 from fifa_predictor.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -15,7 +19,7 @@ load_dotenv()
 
 _API_BASE = "https://api.the-odds-api.com/v4"
 _REGIONS = "eu"
-_MARKETS = "h2h"
+_MARKETS = "h2h,totals"
 _REQUEST_TIMEOUT = 30
 
 # Maps the project's competition identifiers to The Odds API sport keys.
@@ -23,18 +27,30 @@ _SPORT_KEYS = {
     "world_cup_2026": "soccer_fifa_world_cup",
 }
 
-_COLUMNS = [
-    "match_id",
-    "commence_time",
+_EVENT_COLUMNS = ["match_id", "commence_time", "home_team", "away_team"]
+
+_GAME_COLUMNS = [
+    "game_id",
     "home_team",
     "away_team",
-    "bookmaker",
-    "home_odds",
-    "draw_odds",
-    "away_odds",
+    "commence_time",
+    "pinnacle_h2h_home",
+    "pinnacle_h2h_draw",
+    "pinnacle_h2h_away",
+    "pinnacle_ou_line",
+    "pinnacle_ou_over",
+    "pinnacle_ou_under",
+    "odds_source",
 ]
 
-_EVENT_COLUMNS = ["match_id", "commence_time", "home_team", "away_team"]
+_FLOAT_COLUMNS = [
+    "pinnacle_h2h_home",
+    "pinnacle_h2h_draw",
+    "pinnacle_h2h_away",
+    "pinnacle_ou_line",
+    "pinnacle_ou_over",
+    "pinnacle_ou_under",
+]
 
 
 def _request_json(competition: str, endpoint: str, params: dict | None = None):
@@ -82,33 +98,36 @@ def _request_json(competition: str, endpoint: str, params: dict | None = None):
 
 
 def fetch_odds(competition: str) -> pd.DataFrame:
-    """Retrieve bookmaker odds for the earliest-kickoff match in the competition.
+    """Retrieve Pinnacle (or consensus) h2h + totals odds for every game.
+
+    Fetches both the match-result (h2h) and over/under (totals) markets in a
+    single API call. Odds are taken from Pinnacle when available, otherwise from
+    the median consensus of all books, resolved independently per market. All
+    stored odds are vig-free (de-vigged), so every row is on the same footing
+    regardless of odds_source.
 
     Args:
         competition: Name or identifier of the competition (e.g. "world_cup_2026").
 
     Returns:
-        A tidy DataFrame with one row per bookmaker for the selected match, with
-        columns match_id, commence_time, home_team, away_team, bookmaker,
-        home_odds, draw_odds, away_odds. Returns an empty, correctly-typed
-        DataFrame if the API reports no matches.
+        A wide DataFrame, one row per game, with the columns in _GAME_COLUMNS.
+        Missing markets are filled with NaN; odds_source records provenance
+        (pinnacle / consensus / mixed). Returns an empty, correctly-typed frame
+        if no games are priced.
     """
-    logger.info("Requesting odds for %s", competition)
-    matches = _request_json(
+    logger.info("Requesting odds (h2h, totals) for %s", competition)
+    games = _request_json(
         competition,
         "odds",
         {"regions": _REGIONS, "markets": _MARKETS, "oddsFormat": "decimal"},
     )
-    logger.info("API returned %d match(es)", len(matches))
+    logger.info("API returned %d game(s)", len(games))
 
-    if not matches:
-        logger.warning("No matches returned for %s; returning empty frame", competition)
-        return _build_frame([])
+    if not games:
+        logger.warning("No games returned for %s; returning empty frame", competition)
+        return _build_games_frame([])
 
-    match = min(matches, key=lambda m: m["commence_time"])
-    rows = _parse_match(match)
-    logger.info("Parsed %d bookmaker row(s) for match %s", len(rows), match["id"])
-    return _build_frame(rows)
+    return _build_games_frame([_parse_game(g) for g in games])
 
 
 def list_events(competition: str) -> pd.DataFrame:
@@ -148,60 +167,193 @@ def _build_event_frame(rows: list[dict]) -> pd.DataFrame:
     return df.sort_values("commence_time", ignore_index=True)
 
 
-def _parse_match(match: dict) -> list[dict]:
-    """Flatten one match's bookmakers into tidy row dicts, skipping malformed ones."""
-    rows: list[dict] = []
-    home_team = match["home_team"]
-    away_team = match["away_team"]
-    for bookmaker in match.get("bookmakers", []):
-        prices = _h2h_prices(bookmaker, home_team, away_team)
-        if prices is None:
-            continue
-        rows.append(
-            {
-                "match_id": match["id"],
-                "commence_time": match["commence_time"],
-                "home_team": home_team,
-                "away_team": away_team,
-                "bookmaker": bookmaker["key"],
-                **prices,
-            }
-        )
-    return rows
+def _pinnacle(game: dict) -> dict | None:
+    return next((b for b in game.get("bookmakers", []) if b.get("key") == "pinnacle"), None)
 
 
-def _h2h_prices(bookmaker: dict, home_team: str, away_team: str) -> dict | None:
-    """Return home/draw/away odds for a bookmaker, or None if h2h data is missing."""
-    market = next(
-        (m for m in bookmaker.get("markets", []) if m.get("key") == "h2h"), None
-    )
-    if market is None:
-        logger.warning(
-            "Bookmaker %s has no h2h market; skipping", bookmaker.get("key")
-        )
-        return None
+def _market(bookmaker: dict, key: str) -> dict | None:
+    return next((m for m in bookmaker.get("markets", []) if m.get("key") == key), None)
 
+
+def _h2h_odds(market: dict, home_team: str, away_team: str) -> tuple | None:
     by_name = {o["name"]: o["price"] for o in market.get("outcomes", [])}
     try:
-        return {
-            "home_odds": float(by_name[home_team]),
-            "draw_odds": float(by_name["Draw"]),
-            "away_odds": float(by_name[away_team]),
-        }
-    except KeyError as missing:
-        logger.warning(
-            "Bookmaker %s missing outcome %s; skipping",
-            bookmaker.get("key"),
-            missing,
-        )
+        return (float(by_name[home_team]), float(by_name["Draw"]), float(by_name[away_team]))
+    except KeyError:
         return None
 
 
-def _build_frame(rows: list[dict]) -> pd.DataFrame:
-    """Assemble parsed rows into a typed DataFrame with the canonical columns."""
-    df = pd.DataFrame(rows, columns=_COLUMNS)
+def _totals_lines(market: dict) -> list[tuple]:
+    """Group a totals market's outcomes by line into (point, over, under) tuples."""
+    by_point: dict = {}
+    for o in market.get("outcomes", []):
+        point = o.get("point")
+        if point is None:
+            continue
+        by_point.setdefault(point, {})[o["name"]] = o["price"]
+    return [(p, d.get("Over"), d.get("Under")) for p, d in by_point.items()]
+
+
+def _on_grid(point: float) -> bool:
+    """True if the line sits on the 0.5 grid (excludes quarter/Asian lines)."""
+    return abs(point * 2 - round(point * 2)) < 1e-9
+
+
+def _score_line(over: float, under: float) -> float:
+    """Absolute gap between vig-removed Over and Under probabilities (0 = even)."""
+    fair = vig_removal.remove_vig(vig_removal.odds_to_implied_probabilities(np.array([over, under])))
+    return abs(fair[0] - fair[1])
+
+
+def _select_line(lines: list[tuple]) -> tuple | None:
+    """Pick the 0.5-grid totals line closest to 50/50 after vig removal.
+
+    Lines missing either price or off the 0.5 grid are excluded. Ties break to
+    the line closest to 2.5, then to the lower line.
+    """
+    eligible = [
+        (p, o, u) for (p, o, u) in lines
+        if o is not None and u is not None and _on_grid(p)
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda t: (_score_line(t[1], t[2]), abs(t[0] - 2.5), t[0]))
+
+
+def _fair_probs(odds: list) -> np.ndarray:
+    """De-vig a set of decimal odds into fair probabilities summing to 1."""
+    return vig_removal.remove_vig(vig_removal.odds_to_implied_probabilities(np.array(odds, dtype=float)))
+
+
+def _probs_to_odds(probs) -> tuple:
+    """Convert fair probabilities into decimal odds (1 / p)."""
+    return tuple(float(1.0 / p) for p in probs)
+
+
+def _fair_odds(odds: list) -> tuple:
+    """Strip vig from a set of decimal odds, returning fair decimal odds."""
+    return _probs_to_odds(_fair_probs(odds))
+
+
+def _consensus_h2h(bookmakers: list[dict], home_team: str, away_team: str) -> tuple | None:
+    """Consensus h2h as vig-free odds.
+
+    De-vig each book's prices into fair probabilities, median those probabilities
+    per outcome across books, renormalize, then convert back to decimal odds. This
+    aggregates in probability space rather than medianing raw (vig-laden) odds.
+    """
+    fair_triples = []
+    for book in bookmakers:
+        market = _market(book, "h2h")
+        if not market:
+            continue
+        odds = _h2h_odds(market, home_team, away_team)
+        if odds:
+            fair_triples.append(_fair_probs(odds))
+    if not fair_triples:
+        return None
+    probs = np.median(np.array(fair_triples), axis=0)
+    probs = probs / probs.sum()
+    return _probs_to_odds(probs)
+
+
+def _consensus_totals(bookmakers: list[dict]) -> tuple | None:
+    """Consensus totals as vig-free odds per line, then the balanced-line pick.
+
+    For each line, de-vig each book's Over/Under into fair probabilities, median
+    them across books, renormalize, and convert back to decimal odds before
+    selecting the most balanced 0.5-grid line.
+    """
+    fair_by_line: dict = defaultdict(list)
+    for book in bookmakers:
+        market = _market(book, "totals")
+        if not market:
+            continue
+        for point, over, under in _totals_lines(market):
+            if over is None or under is None:
+                continue
+            fair = _fair_probs([over, under])
+            fair_by_line[point].append((float(fair[0]), float(fair[1])))
+    consensus_lines = []
+    for point, probs in fair_by_line.items():
+        median = np.median(np.array(probs), axis=0)
+        median = median / median.sum()
+        over_odds, under_odds = _probs_to_odds(median)
+        consensus_lines.append((point, over_odds, under_odds))
+    return _select_line(consensus_lines)
+
+
+def _resolve_h2h(game: dict) -> tuple:
+    """Resolve h2h odds: Pinnacle if available, else median consensus, else NaN."""
+    pin = _pinnacle(game)
+    if pin:
+        market = _market(pin, "h2h")
+        if market:
+            odds = _h2h_odds(market, game["home_team"], game["away_team"])
+            if odds:
+                return (*_fair_odds(odds), "pinnacle")
+    consensus = _consensus_h2h(game.get("bookmakers", []), game["home_team"], game["away_team"])
+    if consensus is None:
+        logger.warning("No h2h market for game %s", game["id"])
+        return (float("nan"), float("nan"), float("nan"), "consensus")
+    logger.warning("Pinnacle h2h unavailable for game %s; using consensus", game["id"])
+    return (*consensus, "consensus")
+
+
+def _resolve_totals(game: dict) -> tuple:
+    """Resolve totals: Pinnacle's best line if available, else consensus, else NaN."""
+    pin = _pinnacle(game)
+    if pin:
+        market = _market(pin, "totals")
+        if market:
+            selected = _select_line(_totals_lines(market))
+            if selected:
+                point, over, under = selected
+                fair_over, fair_under = _fair_odds([over, under])
+                return (point, fair_over, fair_under, "pinnacle")
+    consensus = _consensus_totals(game.get("bookmakers", []))
+    if consensus is None:
+        logger.warning("No totals market for game %s", game["id"])
+        return (float("nan"), float("nan"), float("nan"), "consensus")
+    logger.warning("Pinnacle totals unavailable for game %s; using consensus", game["id"])
+    return (*consensus, "consensus")
+
+
+def _combine_source(src_h2h: str, src_ou: str) -> str:
+    if src_h2h == "pinnacle" and src_ou == "pinnacle":
+        return "pinnacle"
+    if src_h2h == "pinnacle" or src_ou == "pinnacle":
+        return "mixed"
+    return "consensus"
+
+
+def _parse_game(game: dict) -> dict:
+    """Flatten one game into a wide row dict, resolving each market independently."""
+    h_home, h_draw, h_away, src_h2h = _resolve_h2h(game)
+    ou_line, ou_over, ou_under, src_ou = _resolve_totals(game)
+    odds_source = _combine_source(src_h2h, src_ou)
+    if odds_source != "pinnacle":
+        logger.warning("Game %s using non-Pinnacle odds (%s)", game["id"], odds_source)
+    return {
+        "game_id": game["id"],
+        "home_team": game["home_team"],
+        "away_team": game["away_team"],
+        "commence_time": game["commence_time"],
+        "pinnacle_h2h_home": h_home,
+        "pinnacle_h2h_draw": h_draw,
+        "pinnacle_h2h_away": h_away,
+        "pinnacle_ou_line": ou_line,
+        "pinnacle_ou_over": ou_over,
+        "pinnacle_ou_under": ou_under,
+        "odds_source": odds_source,
+    }
+
+
+def _build_games_frame(rows: list[dict]) -> pd.DataFrame:
+    """Assemble parsed game rows into a typed wide DataFrame."""
+    df = pd.DataFrame(rows, columns=_GAME_COLUMNS)
     df["commence_time"] = pd.to_datetime(df["commence_time"], utc=True)
-    for col in ("home_odds", "draw_odds", "away_odds"):
+    for col in _FLOAT_COLUMNS:
         df[col] = df[col].astype(float)
     return df
 
@@ -218,3 +370,21 @@ def save_odds(odds: pd.DataFrame, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     odds.to_csv(destination, index=False)
     logger.info("Wrote %d row(s) to %s", len(odds), destination)
+
+
+def main() -> None:
+    """Fetch odds for the default competition and write them under data/raw/.
+
+    Entry point for `python -m fifa_predictor.data.fetch_odds` (see the Makefile
+    `odds` target). The competition can be overridden with the first CLI argument.
+    """
+    competition = sys.argv[1] if len(sys.argv) > 1 else "world_cup_2026"
+    odds = fetch_odds(competition)
+    destination = Path("data/raw") / f"odds_{competition}.csv"
+    save_odds(odds, destination)
+    breakdown = odds["odds_source"].value_counts().to_dict() if not odds.empty else {}
+    logger.info("Fetched %d game(s); odds_source breakdown: %s", len(odds), breakdown)
+
+
+if __name__ == "__main__":
+    main()

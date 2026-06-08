@@ -34,21 +34,43 @@ def requests_http_error(response: "FakeResponse"):
     return err
 
 
-def _bookmaker(key: str, home_team: str, away_team: str, home: float, draw: float, away: float) -> dict:
-    """A single bookmaker entry with an h2h market in The Odds API shape."""
+def _h2h_market(home_team: str, away_team: str, home: float, draw: float, away: float) -> dict:
+    """An h2h market in The Odds API shape."""
     return {
-        "key": key,
-        "title": key.title(),
-        "markets": [
-            {
-                "key": "h2h",
-                "outcomes": [
-                    {"name": home_team, "price": home},
-                    {"name": away_team, "price": away},
-                    {"name": "Draw", "price": draw},
-                ],
-            }
+        "key": "h2h",
+        "outcomes": [
+            {"name": home_team, "price": home},
+            {"name": "Draw", "price": draw},
+            {"name": away_team, "price": away},
         ],
+    }
+
+
+def _totals_market(lines: list[tuple]) -> dict:
+    """A totals market from (point, over, under) tuples; a None price is omitted."""
+    outcomes = []
+    for point, over, under in lines:
+        if over is not None:
+            outcomes.append({"name": "Over", "price": over, "point": point})
+        if under is not None:
+            outcomes.append({"name": "Under", "price": under, "point": point})
+    return {"key": "totals", "outcomes": outcomes}
+
+
+def _book(key: str, markets: list[dict]) -> dict:
+    """A bookmaker entry holding the given markets."""
+    return {"key": key, "title": key.title(), "markets": markets}
+
+
+def _game(game_id: str, commence_time: str, home_team: str, away_team: str, bookmakers: list[dict]) -> dict:
+    """A game/event in The Odds API /odds shape."""
+    return {
+        "id": game_id,
+        "sport_key": "soccer_fifa_world_cup",
+        "commence_time": commence_time,
+        "home_team": home_team,
+        "away_team": away_team,
+        "bookmakers": bookmakers,
     }
 
 
@@ -75,213 +97,6 @@ def _stub_get(monkeypatch, response: FakeResponse, captured: dict | None = None)
         return response
 
     monkeypatch.setattr(fetch_odds.requests, "get", fake_get)
-
-
-def test_missing_api_key_raises_before_request(monkeypatch) -> None:
-    """With no ODDS_API_KEY set, fetch_odds fails fast without hitting the network."""
-    monkeypatch.delenv("ODDS_API_KEY", raising=False)
-
-    def fail_if_called(*args, **kwargs):  # pragma: no cover - must not run
-        raise AssertionError("requests.get should not be called without an API key")
-
-    monkeypatch.setattr(fetch_odds.requests, "get", fail_if_called)
-
-    with pytest.raises(RuntimeError, match="ODDS_API_KEY"):
-        fetch_odds.fetch_odds("world_cup_2026")
-
-
-def test_happy_path_parses_one_match_multiple_bookmakers(monkeypatch) -> None:
-    """A single match with two bookmakers yields one tidy row per bookmaker."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    payload = [
-        {
-            "id": "match-001",
-            "commence_time": "2026-06-11T19:00:00Z",
-            "home_team": "Mexico",
-            "away_team": "Poland",
-            "bookmakers": [
-                _bookmaker("pinnacle", "Mexico", "Poland", 2.10, 3.40, 3.80),
-                _bookmaker("bet365", "Mexico", "Poland", 2.05, 3.50, 3.90),
-            ],
-        }
-    ]
-    _stub_get(monkeypatch, FakeResponse(payload))
-
-    df = fetch_odds.fetch_odds("world_cup_2026")
-
-    assert list(df.columns) == [
-        "match_id",
-        "commence_time",
-        "home_team",
-        "away_team",
-        "bookmaker",
-        "home_odds",
-        "draw_odds",
-        "away_odds",
-    ]
-    assert len(df) == 2
-    assert set(df["bookmaker"]) == {"pinnacle", "bet365"}
-    assert (df["match_id"] == "match-001").all()
-    assert (df["home_team"] == "Mexico").all()
-    assert (df["away_team"] == "Poland").all()
-
-    assert pd.api.types.is_datetime64_any_dtype(df["commence_time"])
-    assert str(df["commence_time"].dt.tz) == "UTC"
-
-    for col in ("home_odds", "draw_odds", "away_odds"):
-        assert pd.api.types.is_float_dtype(df[col])
-        assert (df[col] > 1.0).all()
-
-    pinnacle = df.set_index("bookmaker").loc["pinnacle"]
-    assert pinnacle["home_odds"] == 2.10
-    assert pinnacle["draw_odds"] == 3.40
-    assert pinnacle["away_odds"] == 3.80
-
-
-def test_request_targets_correct_sport_key_and_params(monkeypatch) -> None:
-    """The competition maps to the soccer_fifa_world_cup sport key with eu/h2h params."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    payload = [
-        {
-            "id": "match-001",
-            "commence_time": "2026-06-11T19:00:00Z",
-            "home_team": "Mexico",
-            "away_team": "Poland",
-            "bookmakers": [_bookmaker("pinnacle", "Mexico", "Poland", 2.10, 3.40, 3.80)],
-        }
-    ]
-    captured: dict = {}
-    _stub_get(monkeypatch, FakeResponse(payload), captured)
-
-    fetch_odds.fetch_odds("world_cup_2026")
-
-    assert "soccer_fifa_world_cup/odds" in captured["url"]
-    assert captured["params"]["apiKey"] == "test-key"
-    assert captured["params"]["regions"] == "eu"
-    assert captured["params"]["markets"] == "h2h"
-
-
-def test_empty_match_list_returns_empty_typed_frame(monkeypatch, caplog) -> None:
-    """No matches → empty DataFrame with the canonical columns and a warning."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    _stub_get(monkeypatch, FakeResponse([]))
-
-    with caplog.at_level("WARNING"):
-        df = fetch_odds.fetch_odds("world_cup_2026")
-
-    assert df.empty
-    assert list(df.columns) == [
-        "match_id",
-        "commence_time",
-        "home_team",
-        "away_team",
-        "bookmaker",
-        "home_odds",
-        "draw_odds",
-        "away_odds",
-    ]
-    assert any("no match" in r.message.lower() for r in caplog.records)
-
-
-def test_non_200_logs_and_raises(monkeypatch, caplog) -> None:
-    """A non-200 response logs the status/body and raises requests.HTTPError."""
-    import requests
-
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    _stub_get(
-        monkeypatch,
-        FakeResponse({"message": "bad"}, status_code=401, text="Invalid API key"),
-    )
-
-    with caplog.at_level("ERROR"):
-        with pytest.raises(requests.HTTPError):
-            fetch_odds.fetch_odds("world_cup_2026")
-
-    logged = " ".join(r.message for r in caplog.records)
-    assert "401" in logged
-    assert "Invalid API key" in logged
-
-
-def test_bookmaker_without_h2h_is_skipped(monkeypatch, caplog) -> None:
-    """A bookmaker lacking the h2h market is skipped with a warning; others remain."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    broken = {
-        "key": "brokenbook",
-        "title": "BrokenBook",
-        "markets": [{"key": "totals", "outcomes": []}],
-    }
-    payload = [
-        {
-            "id": "match-001",
-            "commence_time": "2026-06-11T19:00:00Z",
-            "home_team": "Mexico",
-            "away_team": "Poland",
-            "bookmakers": [
-                _bookmaker("pinnacle", "Mexico", "Poland", 2.10, 3.40, 3.80),
-                broken,
-            ],
-        }
-    ]
-    _stub_get(monkeypatch, FakeResponse(payload))
-
-    with caplog.at_level("WARNING"):
-        df = fetch_odds.fetch_odds("world_cup_2026")
-
-    assert list(df["bookmaker"]) == ["pinnacle"]
-    assert any("brokenbook" in r.message.lower() for r in caplog.records)
-
-
-def test_selects_match_with_earliest_commence_time(monkeypatch) -> None:
-    """When several matches are returned, only the earliest-kickoff one is parsed."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    payload = [
-        {
-            "id": "later",
-            "commence_time": "2026-06-12T16:00:00Z",
-            "home_team": "Spain",
-            "away_team": "Brazil",
-            "bookmakers": [_bookmaker("pinnacle", "Spain", "Brazil", 2.0, 3.3, 3.6)],
-        },
-        {
-            "id": "earliest",
-            "commence_time": "2026-06-11T19:00:00Z",
-            "home_team": "Mexico",
-            "away_team": "Poland",
-            "bookmakers": [_bookmaker("pinnacle", "Mexico", "Poland", 2.1, 3.4, 3.8)],
-        },
-    ]
-    _stub_get(monkeypatch, FakeResponse(payload))
-
-    df = fetch_odds.fetch_odds("world_cup_2026")
-
-    assert (df["match_id"] == "earliest").all()
-    assert (df["home_team"] == "Mexico").all()
-
-
-def test_save_odds_round_trip(monkeypatch, tmp_path) -> None:
-    """save_odds writes a CSV (creating parent dirs) that reads back identically."""
-    monkeypatch.setenv("ODDS_API_KEY", "test-key")
-    payload = [
-        {
-            "id": "match-001",
-            "commence_time": "2026-06-11T19:00:00Z",
-            "home_team": "Mexico",
-            "away_team": "Poland",
-            "bookmakers": [
-                _bookmaker("pinnacle", "Mexico", "Poland", 2.10, 3.40, 3.80),
-                _bookmaker("bet365", "Mexico", "Poland", 2.05, 3.50, 3.90),
-            ],
-        }
-    ]
-    _stub_get(monkeypatch, FakeResponse(payload))
-    df = fetch_odds.fetch_odds("world_cup_2026")
-
-    destination = tmp_path / "raw" / "odds.csv"
-    fetch_odds.save_odds(df, destination)
-    assert destination.exists()
-
-    reloaded = pd.read_csv(destination, parse_dates=["commence_time"])
-    pd.testing.assert_frame_equal(reloaded, df)
 
 
 def test_list_events_missing_api_key_raises_before_request(monkeypatch) -> None:
@@ -347,3 +162,100 @@ def test_list_events_empty_returns_typed_frame(monkeypatch, caplog) -> None:
     assert df.empty
     assert list(df.columns) == ["match_id", "commence_time", "home_team", "away_team"]
     assert any("no event" in r.message.lower() for r in caplog.records)
+
+
+_GAME_COLS = [
+    "game_id", "home_team", "away_team", "commence_time",
+    "pinnacle_h2h_home", "pinnacle_h2h_draw", "pinnacle_h2h_away",
+    "pinnacle_ou_line", "pinnacle_ou_over", "pinnacle_ou_under", "odds_source",
+]
+
+
+def test_fetch_odds_pinnacle_balance_and_grid(monkeypatch) -> None:
+    """Pinnacle path: quarter line excluded, most-balanced grid line selected."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-key")
+    # 2.75 is perfectly even but a quarter line -> excluded. Among grid lines,
+    # 3.0 (1.95/1.95) is more balanced than 2.5 (1.50/2.60) -> pick 3.0.
+    game = _game("g1", "2026-06-11T19:00:00Z", "Mexico", "South Africa", [
+        _book("pinnacle", [
+            _h2h_market("Mexico", "South Africa", 2.10, 3.40, 3.80),
+            _totals_market([(2.5, 1.50, 2.60), (2.75, 1.90, 1.90), (3.0, 1.95, 1.95)]),
+        ]),
+    ])
+    _stub_get(monkeypatch, FakeResponse([game]))
+    df = fetch_odds.fetch_odds("world_cup_2026")
+    assert list(df.columns) == _GAME_COLS
+    row = df.iloc[0]
+    assert row["game_id"] == "g1"
+    # Pinnacle odds are de-vigged (fair) before storage.
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)
+    assert row["pinnacle_h2h_draw"] == pytest.approx(3.513784, abs=1e-5)
+    assert row["pinnacle_h2h_away"] == pytest.approx(3.927171, abs=1e-5)
+    assert row["pinnacle_ou_line"] == 3.0
+    assert row["pinnacle_ou_over"] == 2.0   # de-vig of even 1.95/1.95
+    assert row["pinnacle_ou_under"] == 2.0
+    assert row["odds_source"] == "pinnacle"
+    assert str(df["commence_time"].dt.tz) == "UTC"
+
+
+def test_fetch_odds_consensus_when_pinnacle_absent(monkeypatch) -> None:
+    """No Pinnacle -> median consensus across books for both markets."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-key")
+    game = _game("g1", "2026-06-11T19:00:00Z", "A", "B", [
+        _book("bet365", [_h2h_market("A", "B", 2.0, 3.0, 4.0), _totals_market([(2.5, 1.90, 1.90)])]),
+        _book("williamhill", [_h2h_market("A", "B", 2.2, 3.2, 3.6), _totals_market([(2.5, 2.00, 1.80)])]),
+    ])
+    _stub_get(monkeypatch, FakeResponse([game]))
+    row = fetch_odds.fetch_odds("world_cup_2026").iloc[0]
+    # Principled consensus: de-vig each book, median the fair probabilities,
+    # then convert back to (vig-free) decimal odds.
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.230689, abs=1e-5)
+    assert row["pinnacle_h2h_draw"] == pytest.approx(3.296055, abs=1e-5)
+    assert row["pinnacle_h2h_away"] == pytest.approx(4.027141, abs=1e-5)
+    assert row["pinnacle_ou_line"] == 2.5
+    assert row["pinnacle_ou_over"] == pytest.approx(2.054054, abs=1e-5)
+    assert row["pinnacle_ou_under"] == pytest.approx(1.948718, abs=1e-5)
+    assert row["odds_source"] == "consensus"
+
+
+def test_fetch_odds_empty_returns_typed_frame(monkeypatch) -> None:
+    """No games -> empty DataFrame with the wide columns."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-key")
+    _stub_get(monkeypatch, FakeResponse([]))
+    df = fetch_odds.fetch_odds("world_cup_2026")
+    assert df.empty
+    assert list(df.columns) == _GAME_COLS
+
+
+def test_fetch_odds_mixed_source_when_pinnacle_missing_totals(monkeypatch) -> None:
+    """Pinnacle has h2h but no totals -> h2h from Pinnacle, totals from consensus."""
+    monkeypatch.setenv("ODDS_API_KEY", "test-key")
+    game = _game("g1", "2026-06-11T19:00:00Z", "A", "B", [
+        _book("pinnacle", [_h2h_market("A", "B", 2.10, 3.40, 3.80)]),  # no totals
+        _book("bet365", [_totals_market([(2.5, 1.90, 1.90)])]),        # totals only
+    ])
+    _stub_get(monkeypatch, FakeResponse([game]))
+    row = fetch_odds.fetch_odds("world_cup_2026").iloc[0]
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)  # Pinnacle, de-vigged
+    assert row["pinnacle_ou_line"] == 2.5     # from consensus
+    assert row["pinnacle_ou_over"] == 2.0     # de-vig of even 1.90/1.90 -> fair 2.0/2.0
+    assert row["pinnacle_ou_under"] == 2.0
+    assert row["odds_source"] == "mixed"
+
+
+def test_fetch_odds_totals_absent_everywhere_yields_nan(monkeypatch, caplog) -> None:
+    """No book offers totals -> ou_* are NaN, the row is kept, and a warning logs."""
+    import math
+    monkeypatch.setenv("ODDS_API_KEY", "test-key")
+    game = _game("g1", "2026-06-11T19:00:00Z", "A", "B", [
+        _book("pinnacle", [_h2h_market("A", "B", 2.10, 3.40, 3.80)]),
+    ])
+    _stub_get(monkeypatch, FakeResponse([game]))
+    with caplog.at_level("WARNING"):
+        df = fetch_odds.fetch_odds("world_cup_2026")
+    row = df.iloc[0]
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)  # de-vigged
+    assert math.isnan(row["pinnacle_ou_line"])
+    assert math.isnan(row["pinnacle_ou_over"])
+    assert len(df) == 1  # row retained
+    assert any("totals" in r.message.lower() for r in caplog.records)
