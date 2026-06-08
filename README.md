@@ -5,19 +5,28 @@ results, bookmaker odds, and Elo ratings.
 
 ## Overview
 
-The pipeline works in three stages:
+The working pipeline turns bookmaker odds into simulated match outcomes:
 
-1. **Data acquisition** (`fifa_predictor.data`): pulls historical match results,
-   bookmaker odds, and national team Elo ratings.
-2. **Modeling** (`fifa_predictor.model`): converts odds into fair probabilities
-   (vig removal), derives implied goal-scoring rates (Poisson inversion), fits a
-   Dixon-Coles model for scoreline probabilities, and runs Monte Carlo tournament
-   simulations.
-3. **Utilities** (`fifa_predictor.utils`): shared infrastructure such as logging
-   configuration.
+1. **Fetch odds** (`fifa_predictor.data.fetch_odds`): pulls h2h (1X2) and
+   over/under markets from The Odds API, preferring Pinnacle and falling back to
+   a multi-book consensus, and writes vig-free-ready odds to a CSV.
+2. **Invert odds to goal rates** (`fifa_predictor.model.vig_removal` +
+   `poisson_inversion`): removes the bookmaker overround, then solves the 1X2 +
+   over/under probabilities for implied Dixon-Coles goal rates (λ_home, λ_away).
+3. **Simulate each game** (`fifa_predictor.model.monte_carlo`): builds a
+   Dixon-Coles scoreline matrix from the implied rates and Monte Carlo samples it
+   to produce per-game outcome probabilities and the most likely scoreline.
 
-The project is currently a skeleton: module stubs are in place but the modeling
-and data-fetching logic has not been implemented yet.
+### Implementation status
+
+| Area | Status |
+|---|---|
+| Odds fetching (`fetch_odds`) | Implemented |
+| Vig removal, Poisson/Dixon-Coles inversion | Implemented |
+| Per-game Monte Carlo (`simulate_games_from_odds`) | Implemented |
+| Results & Elo fetching (`fetch_results`, `fetch_elo`) | Stub |
+| Standalone Dixon-Coles MLE fit (`dixon_coles.py`) | Stub |
+| Full tournament bracket (`simulate_tournament`) | Stub |
 
 ## Installation
 
@@ -28,13 +37,35 @@ make install
 This installs the package in editable mode along with its dev dependencies
 (pytest, ruff).
 
+Fetching odds requires a The Odds API key. Put it in a `.env` file at the repo
+root:
+
+```
+ODDS_API_KEY=your_key_here
+```
+
 ## Usage
 
-Fetch raw data:
+Fetch vig-free odds for the World Cup (writes `data/raw/odds_world_cup_2026.csv`):
 
 ```
-make data
+make odds
 ```
+
+Simulate every game in that odds file and write a per-game summary to
+`data/processed/simulated_outcomes_world_cup_2026.csv`:
+
+```python
+from fifa_predictor.model.monte_carlo import simulate_games_from_odds
+
+df = simulate_games_from_odds("data/raw/odds_world_cup_2026.csv", seed=1)
+```
+
+Each output row carries the implied goal rates (`lh`, `la`), the fit quality
+(`residual_norm`), simulated `sim_p_home/draw/away`, and the
+`most_likely_scoreline` with its frequency. Tunables include `n_simulations`,
+`rho` (Dixon-Coles correlation), `max_goals`, and `seed`; see the
+`simulate_games_from_odds` docstring.
 
 Run the test suite:
 
@@ -60,9 +91,12 @@ make clean    # remove __pycache__ and .pytest_cache
 
 ```
 src/fifa_predictor/
-├── data/      fetch_results.py, fetch_odds.py, fetch_elo.py
-├── model/     vig_removal.py, poisson_inversion.py, dixon_coles.py, monte_carlo.py
+├── data/      fetch_odds.py            (fetch_results.py, fetch_elo.py: stubs)
+├── model/     vig_removal.py, poisson_inversion.py, monte_carlo.py
+│              (dixon_coles.py: stub; monte_carlo.simulate_tournament: stub)
 └── utils/     logging_config.py
 ```
+
+Raw odds land in `data/raw/`; simulation output goes to `data/processed/`.
 
 See `.claude/CLAUDE.md` for project conventions and constraints.

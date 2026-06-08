@@ -1,26 +1,31 @@
-.PHONY: install test smoke lint format clean data odds
+# Interpreter for all targets. Override for CI, e.g. `make test PYTHON=python`.
+PYTHON ?= .venv/bin/python
+
+.PHONY: install test smoke lint format clean odds simulate
 
 install:
-	pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e ".[dev]"
 
 test:
-	pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 smoke:
-	pytest tests/smoke_test.py -v
+	$(PYTHON) -m pytest tests/smoke_test.py -v
 
 lint:
-	ruff check src/
+	$(PYTHON) -m ruff check src/
 
 format:
-	ruff format src/
+	$(PYTHON) -m ruff format src/
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	find . -type d -name ".pytest_cache" -exec rm -rf {} +
 
-data:
-	python -m fifa_predictor.data.fetch_results
-
+# Fetch vig-free odds -> data/raw/odds_<competition>.csv
 odds:
-	python -m fifa_predictor.data.fetch_odds
+	$(PYTHON) -m fifa_predictor.data.fetch_odds
+
+# Simulate every game from the odds CSV -> data/processed/simulated_outcomes_<competition>.csv
+simulate:
+	$(PYTHON) -m fifa_predictor.model.monte_carlo
