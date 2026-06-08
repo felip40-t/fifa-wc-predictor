@@ -55,17 +55,24 @@ make odds
 Simulate every game in that odds file and write a per-game summary to
 `data/processed/simulated_outcomes_world_cup_2026.csv`:
 
+```
+make simulate
+```
+
+Each output row carries the implied goal rates (`lh`, `la`), the fit quality
+(`residual_norm`), simulated `sim_p_home/draw/away`, and the
+`most_likely_scoreline` with its frequency.
+
+For more control, call the function directly to set `n_simulations`, `rho`
+(Dixon-Coles correlation), `max_goals`, or a `seed` for reproducibility:
+
 ```python
 from fifa_predictor.model.monte_carlo import simulate_games_from_odds
 
 df = simulate_games_from_odds("data/raw/odds_world_cup_2026.csv", seed=1)
 ```
 
-Each output row carries the implied goal rates (`lh`, `la`), the fit quality
-(`residual_norm`), simulated `sim_p_home/draw/away`, and the
-`most_likely_scoreline` with its frequency. Tunables include `n_simulations`,
-`rho` (Dixon-Coles correlation), `max_goals`, and `seed`; see the
-`simulate_games_from_odds` docstring.
+See the `simulate_games_from_odds` docstring for the full set of options.
 
 Run the test suite:
 
