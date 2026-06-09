@@ -3,10 +3,19 @@
 All network access is stubbed; the suite never makes a live API call.
 """
 
+import math
+
 import pandas as pd
 import pytest
 
 from fifa_predictor.data import fetch_odds
+from fifa_predictor.data.fetch_odds import (
+    _GAME_COLUMNS,
+    _build_games_frame,
+    _parse_game,
+    _resolve_secondary_totals,
+    _select_pinnacle_secondary,
+)
 
 
 class FakeResponse:
@@ -167,7 +176,9 @@ def test_list_events_empty_returns_typed_frame(monkeypatch, caplog) -> None:
 _GAME_COLS = [
     "game_id", "home_team", "away_team", "commence_time",
     "pinnacle_h2h_home", "pinnacle_h2h_draw", "pinnacle_h2h_away",
-    "pinnacle_ou_line", "pinnacle_ou_over", "pinnacle_ou_under", "odds_source",
+    "pinnacle_ou_line", "pinnacle_ou_over", "pinnacle_ou_under",
+    "pinnacle_ou2_line", "pinnacle_ou2_over", "pinnacle_ou2_under",
+    "odds_source",
 ]
 
 
@@ -188,9 +199,10 @@ def test_fetch_odds_pinnacle_balance_and_grid(monkeypatch) -> None:
     row = df.iloc[0]
     assert row["game_id"] == "g1"
     # Pinnacle odds are de-vigged (fair) before storage.
-    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)
-    assert row["pinnacle_h2h_draw"] == pytest.approx(3.513784, abs=1e-5)
-    assert row["pinnacle_h2h_away"] == pytest.approx(3.927171, abs=1e-5)
+    # Power method: home (favorite) gained prob vs proportional (2.1703 -> 2.1504).
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.150444, abs=1e-5)  # power-method de-vig
+    assert row["pinnacle_h2h_draw"] == pytest.approx(3.535758, abs=1e-5)  # power-method de-vig
+    assert row["pinnacle_h2h_away"] == pytest.approx(3.965817, abs=1e-5)  # power-method de-vig
     assert row["pinnacle_ou_line"] == 3.0
     assert row["pinnacle_ou_over"] == 2.0   # de-vig of even 1.95/1.95
     assert row["pinnacle_ou_under"] == 2.0
@@ -209,12 +221,13 @@ def test_fetch_odds_consensus_when_pinnacle_absent(monkeypatch) -> None:
     row = fetch_odds.fetch_odds("world_cup_2026").iloc[0]
     # Principled consensus: de-vig each book, median the fair probabilities,
     # then convert back to (vig-free) decimal odds.
-    assert row["pinnacle_h2h_home"] == pytest.approx(2.230689, abs=1e-5)
-    assert row["pinnacle_h2h_draw"] == pytest.approx(3.296055, abs=1e-5)
-    assert row["pinnacle_h2h_away"] == pytest.approx(4.027141, abs=1e-5)
+    # Power method: each book de-vigged independently; home (favorite) gained prob.
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.193274, abs=1e-5)  # power-method de-vig
+    assert row["pinnacle_h2h_draw"] == pytest.approx(3.322353, abs=1e-5)  # power-method de-vig
+    assert row["pinnacle_h2h_away"] == pytest.approx(4.114055, abs=1e-5)  # power-method de-vig
     assert row["pinnacle_ou_line"] == 2.5
-    assert row["pinnacle_ou_over"] == pytest.approx(2.054054, abs=1e-5)
-    assert row["pinnacle_ou_under"] == pytest.approx(1.948718, abs=1e-5)
+    assert row["pinnacle_ou_over"] == pytest.approx(2.058763, abs=1e-5)   # power-method de-vig
+    assert row["pinnacle_ou_under"] == pytest.approx(1.944499, abs=1e-5)  # power-method de-vig
     assert row["odds_source"] == "consensus"
 
 
@@ -236,7 +249,7 @@ def test_fetch_odds_mixed_source_when_pinnacle_missing_totals(monkeypatch) -> No
     ])
     _stub_get(monkeypatch, FakeResponse([game]))
     row = fetch_odds.fetch_odds("world_cup_2026").iloc[0]
-    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)  # Pinnacle, de-vigged
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.150444, abs=1e-5)  # power-method de-vig (was 2.170279 proportional)
     assert row["pinnacle_ou_line"] == 2.5     # from consensus
     assert row["pinnacle_ou_over"] == 2.0     # de-vig of even 1.90/1.90 -> fair 2.0/2.0
     assert row["pinnacle_ou_under"] == 2.0
@@ -245,7 +258,6 @@ def test_fetch_odds_mixed_source_when_pinnacle_missing_totals(monkeypatch) -> No
 
 def test_fetch_odds_totals_absent_everywhere_yields_nan(monkeypatch, caplog) -> None:
     """No book offers totals -> ou_* are NaN, the row is kept, and a warning logs."""
-    import math
     monkeypatch.setenv("ODDS_API_KEY", "test-key")
     game = _game("g1", "2026-06-11T19:00:00Z", "A", "B", [
         _book("pinnacle", [_h2h_market("A", "B", 2.10, 3.40, 3.80)]),
@@ -254,8 +266,102 @@ def test_fetch_odds_totals_absent_everywhere_yields_nan(monkeypatch, caplog) -> 
     with caplog.at_level("WARNING"):
         df = fetch_odds.fetch_odds("world_cup_2026")
     row = df.iloc[0]
-    assert row["pinnacle_h2h_home"] == pytest.approx(2.170279, abs=1e-5)  # de-vigged
+    assert row["pinnacle_h2h_home"] == pytest.approx(2.150444, abs=1e-5)  # power-method de-vig (was 2.170279 proportional)
     assert math.isnan(row["pinnacle_ou_line"])
     assert math.isnan(row["pinnacle_ou_over"])
     assert len(df) == 1  # row retained
     assert any("totals" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Secondary totals (ou2) tests
+# ---------------------------------------------------------------------------
+
+
+def _pinnacle_game(totals_outcomes):
+    """A minimal /odds game dict with only Pinnacle, h2h + the given totals."""
+    return {
+        "id": "g1",
+        "commence_time": "2026-06-11T19:00:00Z",
+        "home_team": "Home",
+        "away_team": "Away",
+        "bookmakers": [
+            {
+                "key": "pinnacle",
+                "markets": [
+                    {
+                        "key": "h2h",
+                        "outcomes": [
+                            {"name": "Home", "price": 2.0},
+                            {"name": "Draw", "price": 3.4},
+                            {"name": "Away", "price": 4.0},
+                        ],
+                    },
+                    {"key": "totals", "outcomes": totals_outcomes},
+                ],
+            }
+        ],
+    }
+
+
+def _totals(*lines):
+    """Build totals outcomes from (point, over, under) tuples."""
+    out = []
+    for point, over, under in lines:
+        out.append({"name": "Over", "price": over, "point": point})
+        out.append({"name": "Under", "price": under, "point": point})
+    return out
+
+
+def test_select_pinnacle_secondary_picks_most_balanced_quarter_line():
+    market = {"key": "totals", "outcomes": _totals(
+        (2.0, 1.55, 2.45),
+        (2.25, 1.95, 1.90),
+        (3.0, 3.10, 1.37),
+    )}
+    point, over, under = _select_pinnacle_secondary(market)
+    assert point == 2.25
+
+
+def test_resolve_secondary_totals_returns_nan_without_pinnacle_totals():
+    game = {
+        "id": "g2", "commence_time": "2026-06-11T19:00:00Z",
+        "home_team": "Home", "away_team": "Away",
+        "bookmakers": [{"key": "betfair_ex_eu", "markets": []}],
+    }
+    point, over, under = _resolve_secondary_totals(game)
+    assert math.isnan(point) and math.isnan(over) and math.isnan(under)
+
+
+def test_parse_game_emits_secondary_trio_columns():
+    game = _pinnacle_game(_totals((2.5, 1.95, 1.90), (2.25, 1.98, 1.86)))
+    row = _parse_game(game)
+    for col in ("pinnacle_ou2_line", "pinnacle_ou2_over", "pinnacle_ou2_under"):
+        assert col in row
+        assert col in _GAME_COLUMNS
+    assert row["pinnacle_ou2_line"] == 2.25
+    assert 1 / row["pinnacle_ou2_over"] + 1 / row["pinnacle_ou2_under"] == pytest.approx(1.0)
+
+
+def test_parse_game_single_pinnacle_line_becomes_secondary():
+    game = _pinnacle_game(_totals((2.5, 1.95, 1.90)))
+    row = _parse_game(game)
+    frame = _build_games_frame([row])
+    assert "pinnacle_ou2_line" in frame.columns
+    assert row["pinnacle_ou2_line"] == 2.5
+
+
+def test_resolve_secondary_totals_nan_when_pinnacle_has_no_totals():
+    game = {
+        "id": "g3", "commence_time": "2026-06-11T19:00:00Z",
+        "home_team": "Home", "away_team": "Away",
+        "bookmakers": [{"key": "pinnacle", "markets": [
+            {"key": "h2h", "outcomes": [
+                {"name": "Home", "price": 2.0},
+                {"name": "Draw", "price": 3.4},
+                {"name": "Away", "price": 4.0},
+            ]},
+        ]}],
+    }
+    point, over, under = _resolve_secondary_totals(game)
+    assert math.isnan(point) and math.isnan(over) and math.isnan(under)

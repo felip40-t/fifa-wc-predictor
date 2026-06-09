@@ -1,41 +1,54 @@
-"""Tests for the vig removal model module."""
+"""Tests for vig removal (power method)."""
 
 import numpy as np
 import pytest
 
-from fifa_predictor.model import vig_removal
+from fifa_predictor.model.vig_removal import odds_to_implied_probabilities, remove_vig
 
 
-def test_odds_to_implied_probabilities_inverts_odds() -> None:
-    """Each implied probability should be the reciprocal of its decimal odd."""
-    odds = np.array([2.0, 3.5, 4.0])
-
-    imp_probs = vig_removal.odds_to_implied_probabilities(odds)
-
-    np.testing.assert_allclose(imp_probs, 1 / odds)
+def test_fair_probabilities_sum_to_one():
+    raw = odds_to_implied_probabilities(np.array([1.9, 3.8, 3.8]))
+    fair = remove_vig(raw)
+    assert fair.sum() == pytest.approx(1.0)
 
 
-def test_odds_to_implied_probabilities_sums_above_one() -> None:
-    """Raw implied probabilities should sum to more than 1 due to the overround."""
-    imp_probs = vig_removal.odds_to_implied_probabilities(np.array([2.0, 3.5, 4.0]))
-
-    assert imp_probs.sum() > 1.0
-
-
-def test_remove_vig_normalizes_to_one() -> None:
-    """Fair probabilities should be proportional to the input and sum to 1."""
-    raw_probs = np.array([0.5, 0.3, 0.3])
-
-    fair_probs = vig_removal.remove_vig(raw_probs)
-
-    assert fair_probs.sum() == pytest.approx(1.0)
-    np.testing.assert_allclose(fair_probs, raw_probs / raw_probs.sum())
+def test_symmetric_market_is_unchanged_by_power():
+    raw = odds_to_implied_probabilities(np.array([1.9, 1.9]))
+    fair = remove_vig(raw)
+    assert fair == pytest.approx(np.array([0.5, 0.5]))
 
 
-def test_remove_vig_handles_non_positive_total() -> None:
-    """A non-positive total should be handled gracefully rather than dividing by zero."""
-    raw_probs = np.array([0.0, 0.0, 0.0])
+def test_power_gives_favorite_more_than_proportional():
+    odds = np.array([1.5, 4.5, 7.0])
+    raw = odds_to_implied_probabilities(odds)
+    proportional = raw / raw.sum()
+    fair = remove_vig(raw)
+    assert fair[0] > proportional[0]
+    assert fair[2] < proportional[2]
+    assert fair.sum() == pytest.approx(1.0)
 
-    fair_probs = vig_removal.remove_vig(raw_probs)
 
-    np.testing.assert_array_equal(fair_probs, raw_probs)
+def test_already_fair_odds_are_returned_unchanged():
+    fair_probs = np.array([0.5, 0.3, 0.2])
+    raw = fair_probs.copy()
+    out = remove_vig(raw)
+    assert out == pytest.approx(fair_probs)
+
+
+def test_ordering_is_preserved():
+    raw = odds_to_implied_probabilities(np.array([1.6, 4.0, 5.0]))
+    fair = remove_vig(raw)
+    assert fair[0] > fair[1] > fair[2]
+
+
+def test_two_way_market_with_margin_sums_to_one():
+    raw = odds_to_implied_probabilities(np.array([1.8, 2.1]))
+    fair = remove_vig(raw)
+    assert fair.sum() == pytest.approx(1.0)
+    assert fair[0] > fair[1]
+
+
+def test_nonpositive_total_returns_input():
+    raw = np.array([0.0, 0.0])
+    out = remove_vig(raw)
+    assert np.array_equal(out, raw)

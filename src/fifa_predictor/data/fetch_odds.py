@@ -1,5 +1,6 @@
 """Fetches bookmaker odds for upcoming and historical international matches."""
 
+import math
 import os
 import sys
 from collections import defaultdict
@@ -40,6 +41,9 @@ _GAME_COLUMNS = [
     "pinnacle_ou_line",
     "pinnacle_ou_over",
     "pinnacle_ou_under",
+    "pinnacle_ou2_line",
+    "pinnacle_ou2_over",
+    "pinnacle_ou2_under",
     "odds_source",
 ]
 
@@ -50,6 +54,9 @@ _FLOAT_COLUMNS = [
     "pinnacle_ou_line",
     "pinnacle_ou_over",
     "pinnacle_ou_under",
+    "pinnacle_ou2_line",
+    "pinnacle_ou2_over",
+    "pinnacle_ou2_under",
 ]
 
 
@@ -220,6 +227,52 @@ def _select_line(lines: list[tuple]) -> tuple | None:
     return min(eligible, key=lambda t: (_score_line(t[1], t[2]), abs(t[0] - 2.5), t[0]))
 
 
+def _on_quarter_grid(point: float) -> bool:
+    """True if the line sits on the 0.25 grid (allows quarter/Asian lines)."""
+    return abs(point * 4 - round(point * 4)) < 1e-9
+
+
+def _select_pinnacle_secondary(market: dict) -> tuple | None:
+    """Pinnacle's most balanced totals line on the strict quarter grid.
+
+    Admits only lines that are on the 0.25 grid but NOT on the 0.5 grid (i.e.
+    quarter/Asian lines like 2.25 or 2.75 that the primary 0.5-grid filter
+    discards). Falls back to any 0.25-grid line (including 0.5-grid lines) when
+    no strict quarter line exists.
+    Ties break to the line closest to 2.5, then to the lower line.
+    """
+    lines = _totals_lines(market)
+    quarter_only = [
+        (p, o, u) for (p, o, u) in lines
+        if o is not None and u is not None and _on_quarter_grid(p) and not _on_grid(p)
+    ]
+    eligible = quarter_only or [
+        (p, o, u) for (p, o, u) in lines
+        if o is not None and u is not None and _on_quarter_grid(p)
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda t: (_score_line(t[1], t[2]), abs(t[0] - 2.5), t[0]))
+
+
+def _resolve_secondary_totals(game: dict) -> tuple:
+    """Resolve the secondary totals line: Pinnacle's sharpest line, else NaN.
+
+    Sourced from Pinnacle only (the sharp book). Returns vig-free odds. NaN when
+    Pinnacle posts no usable totals market.
+    """
+    pin = _pinnacle(game)
+    if pin:
+        market = _market(pin, "totals")
+        if market:
+            selected = _select_pinnacle_secondary(market)
+            if selected:
+                point, over, under = selected
+                fair_over, fair_under = _fair_odds([over, under])
+                return (point, fair_over, fair_under)
+    return (float("nan"), float("nan"), float("nan"))
+
+
 def _fair_probs(odds: list) -> np.ndarray:
     """De-vig a set of decimal odds into fair probabilities summing to 1."""
     return vig_removal.remove_vig(vig_removal.odds_to_implied_probabilities(np.array(odds, dtype=float)))
@@ -331,6 +384,9 @@ def _parse_game(game: dict) -> dict:
     """Flatten one game into a wide row dict, resolving each market independently."""
     h_home, h_draw, h_away, src_h2h = _resolve_h2h(game)
     ou_line, ou_over, ou_under, src_ou = _resolve_totals(game)
+    ou2_line, ou2_over, ou2_under = _resolve_secondary_totals(game)
+    if not math.isnan(ou2_line) and ou2_line == ou_line:
+        logger.debug("Game %s secondary totals line duplicates the primary (%s)", game["id"], ou_line)
     odds_source = _combine_source(src_h2h, src_ou)
     if odds_source != "pinnacle":
         logger.warning("Game %s using non-Pinnacle odds (%s)", game["id"], odds_source)
@@ -345,6 +401,9 @@ def _parse_game(game: dict) -> dict:
         "pinnacle_ou_line": ou_line,
         "pinnacle_ou_over": ou_over,
         "pinnacle_ou_under": ou_under,
+        "pinnacle_ou2_line": ou2_line,
+        "pinnacle_ou2_over": ou2_over,
+        "pinnacle_ou2_under": ou2_under,
         "odds_source": odds_source,
     }
 

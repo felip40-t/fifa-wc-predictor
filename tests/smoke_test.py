@@ -7,6 +7,7 @@ import pytest
 MODULES = [
     "fifa_predictor",
     "fifa_predictor.utils.logging_config",
+    "fifa_predictor.utils.display",
     "fifa_predictor.data.fetch_results",
     "fifa_predictor.data.fetch_odds",
     "fifa_predictor.data.fetch_elo",
