@@ -108,6 +108,18 @@ the top three scorelines as percentages. Games whose odds inversion fit poorly
 to read a different file, e.g.
 `.venv/bin/python -m fifa_predictor.utils.display world_cup_2026`.
 
+For a single clean prediction per game, write a two-column
+(`match`, `score`) CSV to `data/processed/predictions_world_cup_2026.csv`:
+
+```
+make predict
+```
+
+Each game gets one headline scoreline: the result-consistent `likely_score` when
+the most likely result leads the runner-up result by a clear margin, otherwise
+the single most likely exact score (so a wafer-thin favourite is not forced into
+a win scoreline). Set the competition with `COMP`.
+
 For more control, call the function directly to set the `rho` starting guess
 (the Dixon-Coles correlation is fitted per game, seeded from this value) or
 `max_goals`:

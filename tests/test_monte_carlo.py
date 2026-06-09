@@ -305,3 +305,27 @@ def test_implied_rates_nan_secondary_line_is_ignored():
     with_nan = _implied_rates_from_odds_row(row, -0.13, 10)
     without = _implied_rates_from_odds_row(_base_row(), -0.13, 10)
     assert with_nan == pytest.approx(without)
+
+
+def test_headline_clear_favorite_uses_result_consistent() -> None:
+    # Home leads draw by 45pp >> 8pp: commit to the result-consistent score.
+    out = monte_carlo.select_headline_score(0.65, 0.20, 0.15, "2-0", "1-0")
+    assert out == "2-0"
+
+
+def test_headline_flat_race_uses_most_likely_exact() -> None:
+    # 36 / 32 / 32: top-minus-runner-up = 4pp < 8pp -> fall back to exact score.
+    out = monte_carlo.select_headline_score(0.36, 0.32, 0.32, "1-0", "1-1")
+    assert out == "1-1"
+
+
+def test_headline_boundary_at_margin_commits_to_result() -> None:
+    # Gap exactly 8pp is inclusive (>=), so commit to the result-consistent score.
+    out = monte_carlo.select_headline_score(0.40, 0.32, 0.28, "2-1", "1-1")
+    assert out == "2-1"
+
+
+def test_headline_away_favorite_symmetric() -> None:
+    # Away clearly favored: same behavior as a home favorite.
+    out = monte_carlo.select_headline_score(0.15, 0.20, 0.65, "0-2", "0-1")
+    assert out == "0-2"

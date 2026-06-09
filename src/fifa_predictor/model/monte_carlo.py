@@ -29,6 +29,12 @@ TOP_SCORELINES = 3
 # over-credited an extra goal.
 GOALS_ROUND_UP_AT = 0.7
 
+# Minimum lead (in probability) the top match result must hold over the
+# runner-up result before we commit to that result's scoreline. Below this the
+# race is treated as too close to call and the overall most likely exact score
+# is used instead.
+RESULT_MARGIN = 0.08
+
 
 def simulate_match(scoreline_matrix: np.ndarray, rng: np.random.Generator) -> tuple[int, int]:
     """Sample a single match scoreline from a probability matrix.
@@ -183,6 +189,40 @@ def result_consistent_mode(matrix: np.ndarray) -> str:
     ]
     _, _, home_goals, away_goals = min(candidates)
     return f"{home_goals}-{away_goals}"
+
+
+def select_headline_score(
+    p_home: float,
+    p_draw: float,
+    p_away: float,
+    result_consistent: str,
+    most_likely_exact: str,
+    margin: float = RESULT_MARGIN,
+) -> str:
+    """Pick one headline scoreline for a game.
+
+    When the most likely match result leads the runner-up result by at least
+    ``margin`` (in probability), the favored result is clear, so the
+    result-consistent most likely score is used. Otherwise the race is treated
+    as too close to call and the overall most likely exact scoreline is used, so
+    a wafer-thin favorite does not force a win scoreline.
+
+    Args:
+        p_home: Probability of a home win.
+        p_draw: Probability of a draw.
+        p_away: Probability of an away win.
+        result_consistent: The most likely scoreline within the most likely
+            result (the game's ``likely_score``), as an "h-a" string.
+        most_likely_exact: The single highest-probability exact scoreline (the
+            game's ``score_1``), as an "h-a" string.
+        margin: Minimum top-minus-runner-up result-probability lead required to
+            commit to ``result_consistent``. Defaults to ``RESULT_MARGIN``.
+
+    Returns:
+        Either ``result_consistent`` or ``most_likely_exact`` as an "h-a" string.
+    """
+    top, runner_up = sorted([p_home, p_draw, p_away], reverse=True)[:2]
+    return result_consistent if top - runner_up >= margin else most_likely_exact
 
 
 def _game_outcomes(lh: float, la: float, rho: float, max_goals: int) -> dict:

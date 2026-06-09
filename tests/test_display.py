@@ -88,3 +88,29 @@ def test_reads_from_a_csv_path(tmp_path) -> None:
     _frame().to_csv(path, index=False)
     out = format_simulated_outcomes(str(path))
     assert "Mexico vs South Africa" in out
+
+
+def test_export_predictions_writes_two_column_csv(tmp_path) -> None:
+    from fifa_predictor.utils.display import export_predictions
+
+    df = pd.DataFrame(
+        {
+            "home_team": ["Mexico", "Spain"],
+            "away_team": ["South Africa", "Brazil"],
+            "sim_p_home": [0.69, 0.36],
+            "sim_p_draw": [0.20, 0.32],
+            "sim_p_away": [0.11, 0.32],
+            "likely_score": ["2-0", "1-0"],
+            "score_1": ["1-0", "1-1"],
+        }
+    )
+    out = tmp_path / "predictions.csv"
+    export_predictions(df, out)
+
+    result = pd.read_csv(out)
+    assert list(result.columns) == ["match", "score"]
+    assert len(result) == 2
+    # Clear favorite -> result-consistent score; flat race -> most likely exact.
+    assert result.iloc[0]["match"] == "Mexico vs South Africa"
+    assert result.iloc[0]["score"] == "2-0"
+    assert result.iloc[1]["score"] == "1-1"

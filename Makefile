@@ -1,7 +1,7 @@
 # Interpreter for all targets. Override for CI, e.g. `make test PYTHON=python`.
 PYTHON ?= .venv/bin/python
 
-.PHONY: install test smoke lint format clean odds simulate report
+.PHONY: install test smoke lint format clean odds simulate report predict
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -35,3 +35,7 @@ simulate:
 # Pretty-print the simulated outcomes CSV as an aligned, human-readable table
 report:
 	$(PYTHON) -m fifa_predictor.utils.display
+
+# Write the two-column predictions CSV -> data/processed/predictions_<comp>.csv
+predict:
+	$(PYTHON) -m fifa_predictor.utils.display $(COMP) --predict
