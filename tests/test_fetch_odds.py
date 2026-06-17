@@ -365,3 +365,121 @@ def test_resolve_secondary_totals_nan_when_pinnacle_has_no_totals():
     }
     point, over, under = _resolve_secondary_totals(game)
     assert math.isnan(point) and math.isnan(over) and math.isnan(under)
+
+
+# ---------------------------------------------------------------------------
+# load_odds / merge_odds (preserve historical odds across re-fetches)
+# ---------------------------------------------------------------------------
+
+
+def _row(game_id: str, commence_time: str, home: float = 2.0, **overrides) -> dict:
+    """A game row dict in _GAME_COLUMNS shape with sensible numeric defaults."""
+    row = {
+        "game_id": game_id,
+        "home_team": "Home",
+        "away_team": "Away",
+        "commence_time": commence_time,
+        "pinnacle_h2h_home": home,
+        "pinnacle_h2h_draw": 3.4,
+        "pinnacle_h2h_away": 4.0,
+        "pinnacle_ou_line": 2.5,
+        "pinnacle_ou_over": 1.95,
+        "pinnacle_ou_under": 1.95,
+        "pinnacle_ou2_line": 2.25,
+        "pinnacle_ou2_over": 1.98,
+        "pinnacle_ou2_under": 1.86,
+        "odds_source": "pinnacle",
+    }
+    row.update(overrides)
+    return row
+
+
+def _frame(*rows: dict) -> pd.DataFrame:
+    """Build a typed games frame from row dicts."""
+    return fetch_odds._build_games_frame(list(rows))
+
+
+def test_merge_odds_keeps_completed_games_absent_from_new_fetch():
+    """A game present only in the existing frame (already played) is retained."""
+    existing = _frame(
+        _row("played", "2026-06-11T19:00:00Z"),
+        _row("upcoming", "2026-06-14T19:00:00Z"),
+    )
+    new = _frame(_row("upcoming", "2026-06-14T19:00:00Z"))
+
+    merged = fetch_odds.merge_odds(existing, new)
+
+    assert set(merged["game_id"]) == {"played", "upcoming"}
+
+
+def test_merge_odds_refreshes_upcoming_game_with_new_odds():
+    """A game in both frames takes the new fetch's odds."""
+    existing = _frame(_row("g", "2026-06-14T19:00:00Z", home=2.0))
+    new = _frame(_row("g", "2026-06-14T19:00:00Z", home=1.7))
+
+    merged = fetch_odds.merge_odds(existing, new)
+
+    assert len(merged) == 1
+    assert merged.iloc[0]["pinnacle_h2h_home"] == pytest.approx(1.7)
+
+
+def test_merge_odds_coalesces_nan_in_new_from_existing():
+    """A NaN odds cell in the new row falls back to the existing value."""
+    existing = _frame(_row("g", "2026-06-14T19:00:00Z", pinnacle_ou_line=2.5, pinnacle_ou_over=1.95))
+    new = _frame(_row("g", "2026-06-14T19:00:00Z", pinnacle_ou_line=float("nan"), pinnacle_ou_over=float("nan")))
+
+    merged = fetch_odds.merge_odds(existing, new)
+
+    row = merged.iloc[0]
+    assert row["pinnacle_ou_line"] == 2.5
+    assert row["pinnacle_ou_over"] == pytest.approx(1.95)
+
+
+def test_merge_odds_adds_brand_new_game():
+    """A game only in the new fetch is added to the result."""
+    existing = _frame(_row("old", "2026-06-11T19:00:00Z"))
+    new = _frame(_row("fresh", "2026-06-20T19:00:00Z"))
+
+    merged = fetch_odds.merge_odds(existing, new)
+
+    assert set(merged["game_id"]) == {"old", "fresh"}
+
+
+def test_merge_odds_empty_existing_returns_new():
+    """With no prior odds, the merge is just the new frame."""
+    new = _frame(_row("g", "2026-06-14T19:00:00Z"))
+
+    merged = fetch_odds.merge_odds(_frame(), new)
+
+    assert list(merged["game_id"]) == ["g"]
+
+
+def test_merge_odds_sorts_by_commence_time_and_keeps_columns():
+    """Result carries the canonical columns, sorted by ascending commence_time."""
+    existing = _frame(_row("late", "2026-06-20T19:00:00Z"))
+    new = _frame(_row("early", "2026-06-11T19:00:00Z"))
+
+    merged = fetch_odds.merge_odds(existing, new)
+
+    assert list(merged.columns) == _GAME_COLUMNS
+    assert list(merged["game_id"]) == ["early", "late"]
+
+
+def test_load_odds_missing_file_returns_empty_typed_frame(tmp_path):
+    """Loading a path that does not exist yields an empty frame with the columns."""
+    df = fetch_odds.load_odds(tmp_path / "nope.csv")
+
+    assert df.empty
+    assert list(df.columns) == _GAME_COLUMNS
+
+
+def test_load_odds_round_trips_saved_odds(tmp_path):
+    """A saved frame loads back with UTC commence_time and float odds."""
+    path = tmp_path / "odds.csv"
+    fetch_odds.save_odds(_frame(_row("g", "2026-06-14T19:00:00Z")), path)
+
+    df = fetch_odds.load_odds(path)
+
+    assert list(df["game_id"]) == ["g"]
+    assert str(df["commence_time"].dt.tz) == "UTC"
+    assert df["pinnacle_h2h_home"].dtype == float

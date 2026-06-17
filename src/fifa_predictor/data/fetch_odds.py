@@ -417,6 +417,54 @@ def _build_games_frame(rows: list[dict]) -> pd.DataFrame:
     return df
 
 
+def load_odds(source: Path) -> pd.DataFrame:
+    """Load previously saved odds, or an empty typed frame if the file is absent.
+
+    Args:
+        source: Path to a CSV written by save_odds.
+
+    Returns:
+        A wide DataFrame in _GAME_COLUMNS shape with commence_time as a UTC
+        datetime and float odds columns. Missing files yield an empty frame so
+        callers can merge unconditionally.
+    """
+    source = Path(source)
+    if not source.exists():
+        return _build_games_frame([])
+    df = pd.read_csv(source)
+    df = df.reindex(columns=_GAME_COLUMNS)
+    df["commence_time"] = pd.to_datetime(df["commence_time"], utc=True)
+    for col in _FLOAT_COLUMNS:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def merge_odds(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """Upsert freshly fetched odds onto previously stored odds, keyed by game_id.
+
+    Games only in `existing` (already played, so dropped from the /odds feed) are
+    retained; games in both take the `new` fetch's values, but any odds cell that
+    is NaN in `new` falls back to the stored value so a late empty fetch never
+    blanks out historical odds. Games only in `new` are added.
+
+    Args:
+        existing: Previously stored odds (may be empty).
+        new: Odds from the latest fetch (may be empty).
+
+    Returns:
+        A wide DataFrame in _GAME_COLUMNS shape, sorted by ascending
+        commence_time.
+    """
+    old_idx = existing.set_index("game_id")
+    new_idx = new.set_index("game_id")
+    merged = new_idx.combine_first(old_idx).reset_index()
+    merged = merged.reindex(columns=_GAME_COLUMNS)
+    merged["commence_time"] = pd.to_datetime(merged["commence_time"], utc=True)
+    for col in _FLOAT_COLUMNS:
+        merged[col] = merged[col].astype(float)
+    return merged.sort_values("commence_time", ignore_index=True)
+
+
 def save_odds(odds: pd.DataFrame, destination: Path) -> None:
     """Persist fetched odds data to disk.
 
@@ -438,11 +486,19 @@ def main() -> None:
     `odds` target). The competition can be overridden with the first CLI argument.
     """
     competition = sys.argv[1] if len(sys.argv) > 1 else "world_cup_2026"
-    odds = fetch_odds(competition)
     destination = Path("data/raw") / f"odds_{competition}.csv"
+    existing = load_odds(destination)
+    new = fetch_odds(competition)
+    odds = merge_odds(existing, new)
+    logger.info(
+        "Merged %d fetched game(s) onto %d stored; %d total after merge",
+        len(new),
+        len(existing),
+        len(odds),
+    )
     save_odds(odds, destination)
     breakdown = odds["odds_source"].value_counts().to_dict() if not odds.empty else {}
-    logger.info("Fetched %d game(s); odds_source breakdown: %s", len(odds), breakdown)
+    logger.info("Stored %d game(s); odds_source breakdown: %s", len(odds), breakdown)
 
 
 if __name__ == "__main__":

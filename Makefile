@@ -1,7 +1,7 @@
 # Interpreter for all targets. Override for CI, e.g. `make test PYTHON=python`.
 PYTHON ?= .venv/bin/python
 
-.PHONY: install test smoke lint format clean odds simulate report predict
+.PHONY: install test smoke lint format clean odds results simulate report predict compare
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -26,6 +26,10 @@ clean:
 odds:
 	$(PYTHON) -m fifa_predictor.data.fetch_odds
 
+# Fetch completed-game scores, accumulating -> data/raw/results_<competition>.csv
+results:
+	$(PYTHON) -m fifa_predictor.data.fetch_results
+
 # Summarize every game from the odds CSV -> data/processed/simulated_outcomes_<competition>.csv
 # Override the competition with COMP, e.g. `make simulate COMP=world_cup_2026`.
 COMP ?= world_cup_2026
@@ -39,3 +43,8 @@ report:
 # Write the two-column predictions CSV -> data/processed/predictions_<comp>.csv
 predict:
 	$(PYTHON) -m fifa_predictor.utils.display $(COMP) --predict
+
+# Compare predictions against actual results (played games only); --export also
+# writes data/processed/comparison_<comp>.csv
+compare:
+	$(PYTHON) -m fifa_predictor.utils.compare $(COMP) --export

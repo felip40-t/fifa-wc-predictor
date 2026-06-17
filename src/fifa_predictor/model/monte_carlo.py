@@ -33,7 +33,7 @@ GOALS_ROUND_UP_AT = 0.7
 # runner-up result before we commit to that result's scoreline. Below this the
 # race is treated as too close to call and the overall most likely exact score
 # is used instead.
-RESULT_MARGIN = 0.08
+RESULT_MARGIN = 0.15
 
 
 def simulate_match(scoreline_matrix: np.ndarray, rng: np.random.Generator) -> tuple[int, int]:
@@ -66,26 +66,22 @@ def _row_value(row, key: str) -> float:
 
 
 def _implied_rates_from_odds_row(
-    row, rho_init: float, max_goals: int
+    row, rho: float, max_goals: int
 ) -> tuple[float, float, float, float]:
     """Invert one odds-CSV row into implied Dixon-Coles goal rates.
 
     Vig-removes the h2h odds [home, draw, away] and the over/under odds
-    [over, under], then solves for (lh, la, rho) against those fair
-    probabilities and the row's over/under line. When a secondary over/under
-    line is present (pinnacle_ou2_* columns), it is threaded into
-    implied_goal_rates_dc to sharpen the goal-distribution shape.
+    [over, under], then fits the parameters (lh, la, rho) against those fair
+    probabilities and the row's over/under line.
 
     Args:
         row: A mapping with the pinnacle_h2h_* and pinnacle_ou_* fields (a
-            pandas Series row or a plain dict). May optionally contain
-            pinnacle_ou2_line, pinnacle_ou2_over, pinnacle_ou2_under.
-        rho_init: Initial guess for the fitted Dixon-Coles correlation.
+            pandas Series row or a plain dict).
+        rho: Starting seed for the per-game fitted Dixon-Coles correlation.
         max_goals: Maximum number of goals to consider per team.
 
     Returns:
-        A tuple of (lh, la, rho, residual_norm) from implied_goal_rates_dc,
-        where rho is fitted per game.
+        A tuple of (lh, la, rho, residual_norm) from implied_goal_rates_dc.
     """
     h2h_odds = np.array(
         [row["pinnacle_h2h_home"], row["pinnacle_h2h_draw"], row["pinnacle_h2h_away"]]
@@ -95,29 +91,14 @@ def _implied_rates_from_odds_row(
     ou_odds = np.array([row["pinnacle_ou_over"], row["pinnacle_ou_under"]])
     p_over, _p_under = remove_vig(odds_to_implied_probabilities(ou_odds))
 
-    # pd.isna covers both a missing column (NaN from _row_value) and a NaN read
-    # from the CSV as numpy.float64, and None, in one robust check.
-    secondary_line = _row_value(row, "pinnacle_ou2_line")
-    if pd.isna(secondary_line):
-        secondary_line = None
-        p_over_secondary = None
-    else:
-        ou2_odds = np.array(
-            [row["pinnacle_ou2_over"], row["pinnacle_ou2_under"]]
-        )
-        p_over_secondary, _ = remove_vig(odds_to_implied_probabilities(ou2_odds))
-        secondary_line = float(secondary_line)
-
     return implied_goal_rates_dc(
         p_home,
         p_draw,
         p_away,
         row["pinnacle_ou_line"],
         p_over,
-        rho_init=rho_init,
+        rho=rho,
         max_goals=max_goals,
-        secondary_line=secondary_line,
-        p_over_secondary=p_over_secondary,
     )
 
 
@@ -287,8 +268,8 @@ def simulate_games_from_odds(
         odds_csv_path: Path to the odds CSV (e.g. data/raw/odds_world_cup_2026.csv).
         output_csv_path: Where to write the summary CSV. Defaults to
             data/processed/simulated_outcomes_world_cup_2026.csv.
-        rho: Initial guess for the per-game fitted Dixon-Coles correlation. The
-            actual rho is fitted for each game and surfaced in the output.
+        rho: Starting seed for the per-game fitted Dixon-Coles correlation. The
+            fitted value (one per game) is surfaced in the output.
         max_goals: Maximum number of goals to consider per team.
         progress: When True, show a tqdm progress bar over the games (one step
             per game). Off by default so library use and tests stay quiet.
@@ -307,10 +288,10 @@ def simulate_games_from_odds(
 
     records = []
     for _, row in rows:
-        lh, la, fitted_rho, residual_norm = _implied_rates_from_odds_row(row, rho, max_goals)
-        # Use the per-game fitted rho for the scoreline matrix so the simulated
-        # outcomes stay consistent with the rates we just solved for.
-        outcomes = _game_outcomes(lh, la, fitted_rho, max_goals)
+        lh, la, rho_used, residual_norm = _implied_rates_from_odds_row(row, rho, max_goals)
+        # Build the scoreline matrix at the same fitted rho returned by the
+        # inversion so the simulated outcomes stay consistent with the solve.
+        outcomes = _game_outcomes(lh, la, rho_used, max_goals)
         records.append(
             {
                 "game_id": row["game_id"],
@@ -318,7 +299,7 @@ def simulate_games_from_odds(
                 "away_team": row["away_team"],
                 "lh": lh,
                 "la": la,
-                "rho": fitted_rho,
+                "rho": rho_used,
                 "residual_norm": residual_norm,
                 **outcomes,
             }

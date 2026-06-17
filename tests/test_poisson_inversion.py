@@ -138,44 +138,41 @@ def test_implied_goal_rates_dc_round_trips_through_dc_probabilities() -> None:
     assert residual_norm == pytest.approx(0.0, abs=1e-6)
 
 
-def test_implied_goal_rates_dc_matches_all_three_markets() -> None:
-    """With rho free, the fit reproduces 1X2 AND over/under, not just a compromise.
-
-    These targets are not DC-consistent at a fixed rho: the draw and over/under
-    markets pull the total in different directions. The two-rate (fixed-rho) fit
-    cannot satisfy all three and sacrifices the draw; freeing rho as a third
-    parameter makes the system exactly determined, so every market is matched.
-    """
-    p_home, p_draw, p_away = 0.45, 0.27, 0.28
-    ou_line, p_over = 2.5, 0.52
-
+def test_implied_goal_rates_dc_fits_rho_within_bounds() -> None:
+    """rho is fitted (not fixed): it lands inside RHO_BOUNDS and the fit
+    reproduces the three market prices with a ~0 residual."""
+    p_home, p_draw, p_away, ou_line, p_over = 0.45, 0.27, 0.28, 2.5, 0.52
     lh, la, rho, residual_norm = poisson_inversion.implied_goal_rates_dc(
         p_home, p_draw, p_away, ou_line, p_over, max_goals=10
     )
-
-    fit_home, fit_draw, _ = poisson_inversion.poisson_probs_dc(lh, la, rho, max_goals=10)
-    fit_over = poisson_inversion.poisson_over(lh, la, rho, ou_line, max_goals=10)
-
-    assert fit_home == pytest.approx(p_home, abs=1e-3)
-    assert fit_draw == pytest.approx(p_draw, abs=1e-3)
-    assert fit_over == pytest.approx(p_over, abs=1e-3)
-    assert residual_norm == pytest.approx(0.0, abs=1e-3)
-    # rho stays within the Dixon-Coles sensible band.
-    low, high = poisson_inversion.RHO_BOUNDS
-    assert low <= rho <= high
-
-
-def test_implied_goal_rates_dc_respects_rho_bounds() -> None:
-    """The fitted rho never escapes the Dixon-Coles bounds, even under strain.
-
-    A heavy favourite with a draw/over tension that would want rho below the
-    lower bound must clip to the bound rather than running off to keep tau valid.
-    """
-    lh, la, rho, _ = poisson_inversion.implied_goal_rates_dc(
-        0.18, 0.30, 0.52, 2.5, 0.60, max_goals=10
+    lo, hi = poisson_inversion.RHO_BOUNDS
+    assert lo <= rho <= hi
+    assert residual_norm == pytest.approx(0.0, abs=1e-6)
+    fit_home, fit_draw, _ = poisson_inversion.poisson_probs_dc(lh, la, rho, 10)
+    assert fit_home == pytest.approx(p_home, abs=1e-4)
+    assert fit_draw == pytest.approx(p_draw, abs=1e-4)
+    assert poisson_inversion.poisson_over(lh, la, rho, ou_line, 10) == pytest.approx(
+        p_over, abs=1e-4
     )
-    low, high = poisson_inversion.RHO_BOUNDS
-    assert low <= rho <= high
+
+
+def test_implied_goal_rates_dc_seed_does_not_change_solution() -> None:
+    """rho is a starting seed, not a fixed value: different seeds converge to the
+    same fitted (lh, la, rho) for a well-determined system."""
+    args = (0.45, 0.27, 0.28, 2.5, 0.52)
+    a = poisson_inversion.implied_goal_rates_dc(*args, rho=-0.13, max_goals=10)
+    b = poisson_inversion.implied_goal_rates_dc(*args, rho=-0.05, max_goals=10)
+    assert a[0] == pytest.approx(b[0], abs=1e-4)
+    assert a[1] == pytest.approx(b[1], abs=1e-4)
+    assert a[2] == pytest.approx(b[2], abs=1e-4)
+
+
+def test_implied_goal_rates_dc_rejects_secondary_line_argument() -> None:
+    """The secondary totals line has been removed; passing it is an error."""
+    with pytest.raises(TypeError):
+        poisson_inversion.implied_goal_rates_dc(
+            0.45, 0.27, 0.28, 2.5, 0.52, secondary_line=2.25
+        )
 
 
 def test_scoreline_probabilities_aggregates_to_outcome_probabilities() -> None:
@@ -280,64 +277,19 @@ def test_fair_over_rejects_off_grid_line():
         fair_over_probability(1.4, 1.1, -0.05, 2.1)
 
 
-def test_dc_residuals_length_without_secondary():
+def test_dc_residuals_length_is_three():
+    """The residual vector has the three core market terms (home, draw, over)."""
     res = _dc_residuals((1.4, 1.1, -0.05), 0.4, 0.27, 0.5, 2.5, 10)
     assert res.shape == (3,)
 
 
-def test_dc_residuals_length_with_secondary():
-    res = _dc_residuals(
-        (1.4, 1.1, -0.05), 0.4, 0.27, 0.5, 2.5, 10,
-        secondary_line=2.25, target_over_secondary=0.55, secondary_weight=0.5,
-    )
-    assert res.shape == (4,)
-
-
-def test_dc_residuals_secondary_term_is_weighted():
-    params = (1.4, 1.1, -0.05)
-    model_secondary = fair_over_probability(*params, 2.25, 10)
-    res = _dc_residuals(
-        params, 0.4, 0.27, 0.5, 2.5, 10,
-        secondary_line=2.25, target_over_secondary=0.0, secondary_weight=0.5,  # target 0 so the residual is exactly weight * model_value
-    )
-    assert res[3] == pytest.approx(0.5 * model_secondary)
-
-
-def test_inversion_round_trips_with_secondary_line():
-    lh_true, la_true, rho_true = 1.5, 1.0, -0.06
-    p_home, p_draw, p_away = poisson_probs_dc(lh_true, la_true, rho_true, 10)
-    p_over_primary = poisson_over(lh_true, la_true, rho_true, 2.5, 10)
-    p_over_secondary = fair_over_probability(lh_true, la_true, rho_true, 2.25, 10)
-
-    lh, la, rho, residual_norm = implied_goal_rates_dc(
-        p_home, p_draw, p_away, 2.5, p_over_primary,
-        secondary_line=2.25, p_over_secondary=p_over_secondary,
-    )
-    assert lh == pytest.approx(lh_true, abs=1e-3)
-    assert la == pytest.approx(la_true, abs=1e-3)
-    assert rho == pytest.approx(rho_true, abs=1e-3)
-    assert residual_norm < 1e-3
-
-
-def test_inversion_without_secondary_is_unchanged_path():
-    lh_true, la_true, rho_true = 1.5, 1.0, -0.06
+def test_inversion_round_trips_to_generating_rho():
+    """Targets built at rho=-0.13 invert back to their rates and recover that rho."""
+    lh_true, la_true, rho_true = 1.5, 1.0, -0.13
     p_home, p_draw, p_away = poisson_probs_dc(lh_true, la_true, rho_true, 10)
     p_over = poisson_over(lh_true, la_true, rho_true, 2.5, 10)
-    lh, la, rho, _ = implied_goal_rates_dc(p_home, p_draw, p_away, 2.5, p_over)
+    lh, la, rho, residual_norm = implied_goal_rates_dc(p_home, p_draw, p_away, 2.5, p_over)
     assert lh == pytest.approx(lh_true, abs=0.02)
     assert la == pytest.approx(la_true, abs=0.02)
-    assert rho == pytest.approx(rho_true, abs=0.02)
-
-
-def test_dc_residuals_nan_secondary_treated_as_absent():
-    """A NaN secondary line (no second line in the CSV) yields length-3 residuals."""
-    res = _dc_residuals(
-        (1.4, 1.1, -0.05), 0.4, 0.27, 0.5, 2.5, 10,
-        secondary_line=float("nan"), target_over_secondary=0.55,
-    )
-    assert res.shape == (3,)
-
-
-def test_inversion_requires_secondary_prob_when_line_given():
-    with pytest.raises(ValueError):
-        implied_goal_rates_dc(0.4, 0.27, 0.33, 2.5, 0.5, secondary_line=2.25)
+    assert rho == pytest.approx(rho_true, abs=1e-3)
+    assert residual_norm == pytest.approx(0.0, abs=1e-6)

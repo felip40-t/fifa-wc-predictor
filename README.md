@@ -35,7 +35,9 @@ The working pipeline turns bookmaker odds into simulated match outcomes:
 | Odds fetching (`fetch_odds`) | Implemented |
 | Vig removal, Poisson/Dixon-Coles inversion | Implemented |
 | Per-game outcome summary (`simulate_games_from_odds`) | Implemented |
-| Results & Elo fetching (`fetch_results`, `fetch_elo`) | Stub |
+| Completed-game score fetching (`fetch_results.fetch_scores`) | Implemented |
+| Prediction vs actual comparison (`utils.compare`) | Implemented |
+| Historical results & Elo fetching (`fetch_results` year-range, `fetch_elo`) | Stub |
 | Standalone Dixon-Coles MLE fit (`dixon_coles.py`) | Stub |
 | Full tournament bracket (`simulate_tournament`) | Stub |
 
@@ -120,6 +122,38 @@ the most likely result leads the runner-up result by a clear margin, otherwise
 the single most likely exact score (so a wafer-thin favourite is not forced into
 a win scoreline). Set the competition with `COMP`.
 
+Once games have been played, fetch their final scores from The Odds API
+`/scores` endpoint into `data/raw/results_world_cup_2026.csv`:
+
+```
+make results
+```
+
+That endpoint only reports games completed in the last few days, so results are
+accumulated: each run upserts freshly completed games onto the stored file
+(keyed by `game_id`), and older games persist. Run it periodically through the
+tournament.
+
+Then print predictions next to actual results for every played game:
+
+```
+make compare
+```
+
+This reads the published predictions CSV (so run `make predict` first) and joins
+it to the stored results by the `"Home vs Away"` match string, which results
+reconstructs from its `home_team`/`away_team` columns. Only games in both frames
+(i.e. already played) appear. It shows each matchup with its predicted and actual
+scoreline and ticks `RESULT` (the win/draw/away call matched) and `EXACT` (the
+exact scoreline matched). It also joins the simulated-outcomes CSV (by the same
+match string) to print each game's three most likely scorelines and tick `TOP3`
+when the actual scoreline was one of them, so a near miss (the actual sat in our
+top three but not our single headline pick) is visible even when `EXACT` fails.
+The footer counts exact, result, and top-3 hits out of the games played. The
+predicted scoreline is the same headline `make predict` publishes. `make compare`
+also writes `data/processed/comparison_world_cup_2026.csv`. Set the competition
+with `COMP`.
+
 For more control, call the function directly to set the `rho` starting guess
 (the Dixon-Coles correlation is fitted per game, seeded from this value) or
 `max_goals`:
@@ -156,13 +190,15 @@ make clean    # remove __pycache__ and .pytest_cache
 
 ```
 src/fifa_predictor/
-├── data/      fetch_odds.py            (fetch_results.py, fetch_elo.py: stubs)
+├── data/      fetch_odds.py, fetch_results.py  (fetch_elo.py: stub;
+│              fetch_results year-range path: stub)
 ├── model/     vig_removal.py, poisson_inversion.py, monte_carlo.py
 │              (dixon_coles.py: stub; monte_carlo.simulate_tournament: stub)
-└── utils/     logging_config.py, display.py
+└── utils/     logging_config.py, display.py, compare.py
 ```
 
-Raw odds land in `data/raw/`; simulation output goes to `data/processed/`.
+Raw odds and fetched results land in `data/raw/`; simulation, prediction, and
+comparison output go to `data/processed/`.
 
 See `.claude/CLAUDE.md` for project conventions and constraints.
 

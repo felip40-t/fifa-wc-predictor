@@ -7,9 +7,9 @@ import pandas as pd
 import pytest
 
 from fifa_predictor.model import monte_carlo
-from fifa_predictor.model import poisson_inversion
 from fifa_predictor.model.monte_carlo import _implied_rates_from_odds_row, _row_value
 from fifa_predictor.model.poisson_inversion import (
+    RHO_BOUNDS,
     poisson_probs_dc,
     scoreline_probabilities_dc,
 )
@@ -149,13 +149,13 @@ def test_implied_rates_from_odds_row_returns_positive_rates() -> None:
     row = _synthetic_odds_row()
 
     lh, la, rho, residual_norm = monte_carlo._implied_rates_from_odds_row(
-        row, rho_init=-0.13, max_goals=10
+        row, rho=-0.13, max_goals=10
     )
 
     assert lh > 0
     assert la > 0
-    low, high = poisson_inversion.RHO_BOUNDS
-    assert low <= rho <= high
+    lo, hi = RHO_BOUNDS
+    assert lo <= rho <= hi
     assert residual_norm == pytest.approx(0.0, abs=0.05)
 
 
@@ -276,52 +276,47 @@ def test_row_value_missing_key_returns_nan():
     assert math.isnan(_row_value({}, "pinnacle_ou2_line"))
 
 
-def test_implied_rates_without_secondary_columns_still_works():
+def test_implied_rates_from_base_row_works():
     lh, la, rho, residual = _implied_rates_from_odds_row(_base_row(), -0.13, 10)
     assert lh > 0 and la > 0
-    assert -0.2 <= rho <= 0.2
+    lo, hi = RHO_BOUNDS
+    assert lo <= rho <= hi
 
 
-def test_implied_rates_uses_secondary_line_when_present():
+def test_implied_rates_ignores_stray_secondary_columns():
+    """Leftover pinnacle_ou2_* columns no longer affect the inversion."""
     row = _base_row()
     row.update({
         "pinnacle_ou2_line": 2.25,
         "pinnacle_ou2_over": 1.98,
         "pinnacle_ou2_under": 1.86,
     })
-    lh, la, rho, residual = _implied_rates_from_odds_row(row, -0.13, 10)
-    assert lh > 0 and la > 0
-    assert -0.2 <= rho <= 0.2
-    assert math.isfinite(residual)
-
-
-def test_implied_rates_nan_secondary_line_is_ignored():
-    row = _base_row()
-    row.update({
-        "pinnacle_ou2_line": float("nan"),
-        "pinnacle_ou2_over": float("nan"),
-        "pinnacle_ou2_under": float("nan"),
-    })
-    with_nan = _implied_rates_from_odds_row(row, -0.13, 10)
+    with_ou2 = _implied_rates_from_odds_row(row, -0.13, 10)
     without = _implied_rates_from_odds_row(_base_row(), -0.13, 10)
-    assert with_nan == pytest.approx(without)
+    assert with_ou2 == pytest.approx(without)
 
 
 def test_headline_clear_favorite_uses_result_consistent() -> None:
-    # Home leads draw by 45pp >> 8pp: commit to the result-consistent score.
+    # Home leads draw by 45pp >> 15pp: commit to the result-consistent score.
     out = monte_carlo.select_headline_score(0.65, 0.20, 0.15, "2-0", "1-0")
     assert out == "2-0"
 
 
 def test_headline_flat_race_uses_most_likely_exact() -> None:
-    # 36 / 32 / 32: top-minus-runner-up = 4pp < 8pp -> fall back to exact score.
+    # 36 / 32 / 32: top-minus-runner-up = 4pp < 15pp -> fall back to exact score.
     out = monte_carlo.select_headline_score(0.36, 0.32, 0.32, "1-0", "1-1")
     assert out == "1-1"
 
 
+def test_headline_modest_lead_below_margin_uses_exact() -> None:
+    # 10pp lead clears the old 8pp bar but not the 15pp margin, so fall back.
+    out = monte_carlo.select_headline_score(0.42, 0.32, 0.26, "2-1", "1-1")
+    assert out == "1-1"
+
+
 def test_headline_boundary_at_margin_commits_to_result() -> None:
-    # Gap exactly 8pp is inclusive (>=), so commit to the result-consistent score.
-    out = monte_carlo.select_headline_score(0.40, 0.32, 0.28, "2-1", "1-1")
+    # Gap exactly 15pp is inclusive (>=), so commit to the result-consistent score.
+    out = monte_carlo.select_headline_score(0.45, 0.30, 0.25, "2-1", "1-1")
     assert out == "2-1"
 
 

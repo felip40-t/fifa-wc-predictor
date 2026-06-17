@@ -10,16 +10,6 @@ from fifa_predictor.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Bounds on the Dixon-Coles low-score correlation rho when it is fitted per game.
-# DC's hypothesis is that the correction is a small adjustment to the four
-# low-score cells (their empirical estimate is ~-0.13). The lower bound also
-# keeps tau non-negative for realistic rates: tau(0,1) = 1 + lh*rho and
-# tau(1,0) = 1 + la*rho stay >= 0 as long as rho >= -1/max_rate, and -0.2
-# covers home/away rates up to 5 goals. A symmetric band keeps it well away
-# from the degenerate tau region while still letting rho move enough to make
-# the 1X2 + over/under system exactly determined.
-RHO_BOUNDS = (-0.2, 0.2)
-
 
 def poisson_probabilities(home_rate: float, away_rate: float, max_goals: int) -> tuple[float, float, float]:
     """Compute match outcome probabilities from Poisson goal-scoring rates.
@@ -94,6 +84,17 @@ def scoreline_probabilities(
     pa = poisson.pmf(goals, away_rate)
     return np.outer(ph, pa)
 
+def tau(h, a, lh, la, rho):
+    if h == 0 and a == 0:
+        return 1 - lh * la * rho
+    elif h == 0 and a == 1:
+        return 1 + lh * rho
+    elif h == 1 and a == 0:
+        return 1 + la * rho
+    elif h == 1 and a == 1:
+        return 1 - rho
+    else:
+        return 1.0
 
 def scoreline_probabilities_dc(
     lh: float, la: float, rho: float, max_goals: int
@@ -103,7 +104,7 @@ def scoreline_probabilities_dc(
     Starts from the independent-Poisson outer product and reweights each cell
     by the DC correction tau(h, a, lh, la, rho). Only the four low-score cells
     differ from the plain matrix. Keeping this matrix DC-consistent matters
-    because implied_goal_rates_dc fits (lh, la) under the DC model; simulating
+    because implied_goal_rates_dc fits (lh, la, rho) under the DC model; simulating
     from a non-DC matrix would not match the fitted rates.
 
     Args:
@@ -124,17 +125,6 @@ def scoreline_probabilities_dc(
         matrix[h, a] *= tau(h, a, lh, la, rho)
     return matrix
 
-def tau(h, a, lh, la, rho):
-    if h == 0 and a == 0:
-        return 1 - lh * la * rho
-    elif h == 0 and a == 1:
-        return 1 + lh * rho
-    elif h == 1 and a == 0:
-        return 1 + la * rho
-    elif h == 1 and a == 1:
-        return 1 - rho
-    else:
-        return 1.0
 
 def poisson_probs_dc(lh, la, rho=0.0, max_goals=10):
     p_home, p_draw, p_away = 0.0, 0.0, 0.0
@@ -270,31 +260,40 @@ def _dc_residuals(
     target_over_p: float,
     ou_line: float,
     max_goals: int,
-    secondary_line: float | None = None,
-    target_over_secondary: float | None = None,
-    secondary_weight: float = 0.5,
 ) -> np.ndarray:
     """Residuals between DC-model 1X2/over probabilities and their market targets.
 
-    Fits three parameters (lh, la, rho) against the three core market constraints
-    (home, draw, primary over), so that system is exactly determined. When a
-    secondary over/under line is supplied, its residual is appended at
-    secondary_weight (< 1) so the extra total sharpens the goal-distribution shape
-    without out-voting the full-weight draw constraint. The primary over still uses
-    poisson_over, so with no secondary the residuals are identical to before.
+    Solves for the three parameters (lh, la, rho) against the three core market
+    constraints (home, draw, primary over). Three unknowns for three constraints
+    makes the system exactly determined, so a clean fit drives every residual to
+    ~0 and reproduces the de-vigged market prices, including the draw.
     """
     lh, la, rho = params
     p_home, p_draw, _ = poisson_probs_dc(lh, la, rho, max_goals)
     p_over = poisson_over(lh, la, rho, ou_line, max_goals)
-    residuals = [
-        p_home - target_home_p,
-        p_draw - target_draw_p,
-        p_over - target_over_p,
-    ]
-    if secondary_line is not None and not np.isnan(secondary_line):
-        model_secondary = fair_over_probability(lh, la, rho, secondary_line, max_goals)
-        residuals.append(secondary_weight * (model_secondary - target_over_secondary))
-    return np.array(residuals)
+    return np.array(
+        [
+            p_home - target_home_p,
+            p_draw - target_draw_p,
+            p_over - target_over_p,
+        ]
+    )
+
+
+# Bounds on the fitted Dixon-Coles correlation. Wide enough to cover the
+# market-implied values seen across a full slate (audit: mean ~-0.04, range
+# roughly [-0.28, +0.16]) while keeping the four tau cells positive for normal
+# goal rates. A solve that lands on a bound is rejected for the fixed-rho fallback.
+RHO_BOUNDS = (-0.35, 0.20)
+
+
+def _tau_cells_positive(lh: float, la: float, rho: float) -> bool:
+    """True if all four Dixon-Coles tau cells are strictly positive.
+
+    A non-positive tau would make a low-score cell non-positive, so a fitted rho
+    that violates this is rejected in favour of the fixed-rho fallback.
+    """
+    return all(tau(h, a, lh, la, rho) > 0 for h, a in ((0, 0), (0, 1), (1, 0), (1, 1)))
 
 
 def implied_goal_rates_dc(
@@ -303,21 +302,22 @@ def implied_goal_rates_dc(
     p_away: float,
     ou_line: float,
     p_over: float,
-    rho_init: float = -0.13,
+    rho: float = -0.13,
     max_goals: int = 10,
-    secondary_line: float | None = None,
-    p_over_secondary: float | None = None,
-    secondary_weight: float = 0.5,
 ) -> tuple[float, float, float, float]:
-    """Derive implied DC-adjusted goal rates from 1X2 and over/under probabilities.
+    """Derive implied DC goal rates and correlation from 1X2 and over/under probs.
 
     Solves the system (P(home) = p_home, P(draw) = p_draw, P(over ou_line) =
-    p_over) for the three unknowns (lh, la, rho). With rho held fixed there are
-    only two free parameters for three market constraints, so the system is
-    over-determined and the least-squares compromise systematically sacrifices
-    the draw. Fitting rho as well makes the system exactly determined, so all
-    three markets are honoured. rho is bounded to RHO_BOUNDS to stay within the
-    Dixon-Coles sensible band and keep the tau correction valid.
+    p_over) for the three unknowns (lh, la, rho). Three unknowns for three market
+    constraints makes the system exactly determined, so a clean fit reproduces all
+    three de-vigged market prices with a ~0 residual and the draw is no longer
+    sacrificed to fit the home and over prices. rho is fitted per game, seeded from
+    the rho argument and bounded to RHO_BOUNDS.
+
+    If the free-rho fit fails, lands on a rho bound, or produces a non-positive
+    Dixon-Coles tau cell, the solve falls back to holding rho fixed at the seed and
+    fitting only (lh, la); the returned residual_norm (~0 on a clean free fit) is
+    then non-zero, flagging the fallback.
 
     Args:
         p_home: Vig-free implied probability of a home win.
@@ -325,31 +325,17 @@ def implied_goal_rates_dc(
         p_away: Vig-free implied probability of an away win.
         ou_line: Over/under goals line (e.g. 2.5).
         p_over: Vig-free implied probability that total goals exceed ou_line.
-        rho_init: Initial guess for the fitted Dixon-Coles correlation.
+        rho: Starting seed for the fitted correlation, and the value held fixed if
+            the free fit falls back (default -0.13).
         max_goals: Maximum number of goals to consider per team.
-        secondary_line: Optional second totals line (e.g. 2.25) to sharpen the
-            goal-distribution shape; if None (default) the fit uses only the three
-            core market constraints and behaviour is identical to the no-secondary path.
-            p_over_secondary is required when secondary_line is given; both are
-            ignored otherwise.
-        p_over_secondary: Vig-free implied probability that total goals exceed
-            secondary_line; required when secondary_line is supplied.
-        secondary_weight: Weight applied to the secondary-line residual (default 0.5)
-            so it sharpens the shape without out-voting the full-weight draw constraint.
 
     Returns:
-        A tuple of (home_rate, away_rate, rho, residual_norm), where rho is the
-        fitted Dixon-Coles correlation and residual_norm is the Euclidean norm
-        of the final residual vector, indicating how well the solution fits all
-        three market constraints.
+        A tuple of (home_rate, away_rate, rho, residual_norm). rho is the fitted
+        correlation (or the seed if the fit fell back); residual_norm is the
+        Euclidean norm of the final residual vector.
     """
-    rho_low, rho_high = RHO_BOUNDS
-    if not rho_low <= rho_init <= rho_high:
-        raise ValueError(f"rho_init must lie within RHO_BOUNDS {RHO_BOUNDS}.")
-    if secondary_line is not None and p_over_secondary is None:
-        raise ValueError("p_over_secondary is required when secondary_line is provided.")
-    if not 0 <= secondary_weight <= 1:
-        raise ValueError("secondary_weight must lie in [0, 1].")
+    if not -1 < rho < 1:
+        raise ValueError("rho must lie strictly between -1 and 1.")
 
     # Initial guess: total expected goals ~ ou_line, split by the home/away
     # implied-probability ratio as a proxy for the lh/la ratio. Computed via
@@ -359,21 +345,33 @@ def implied_goal_rates_dc(
     lh0 = max(ou_line * p_home / win_p_total, 1e-3)
     la0 = max(ou_line * p_away / win_p_total, 1e-3)
 
+    rho_lo, rho_hi = RHO_BOUNDS
+    rho_seed = min(max(rho, rho_lo), rho_hi)
     result = least_squares(
         _dc_residuals,
-        x0=(lh0, la0, rho_init),
-        args=(
-            p_home,
-            p_draw,
-            p_over,
-            ou_line,
-            max_goals,
-            secondary_line,
-            p_over_secondary,
-            secondary_weight,
-        ),
-        bounds=((1e-6, 1e-6, rho_low), (np.inf, np.inf, rho_high)),
+        x0=(lh0, la0, rho_seed),
+        args=(p_home, p_draw, p_over, ou_line, max_goals),
+        bounds=((1e-6, 1e-6, rho_lo), (np.inf, np.inf, rho_hi)),
     )
-    lh, la, rho = result.x
-    residual_norm = float(np.linalg.norm(result.fun))
-    return lh, la, rho, residual_norm
+    lh, la, rho_fit = result.x
+    at_bound = abs(rho_fit - rho_lo) < 1e-6 or abs(rho_fit - rho_hi) < 1e-6
+    if result.success and not at_bound and _tau_cells_positive(lh, la, rho_fit):
+        return lh, la, rho_fit, float(np.linalg.norm(result.fun))
+
+    # Fallback: hold rho fixed at the seed and fit only (lh, la), the original
+    # over-determined behaviour. The non-zero residual flags the affected game.
+    logger.warning(
+        "Free-rho fit rejected (success=%s, rho_fit=%.3f); holding rho fixed at %.3f.",
+        result.success,
+        rho_fit,
+        rho,
+    )
+    fixed = least_squares(
+        lambda rates: _dc_residuals(
+            (rates[0], rates[1], rho), p_home, p_draw, p_over, ou_line, max_goals
+        ),
+        x0=(lh0, la0),
+        bounds=((1e-6, 1e-6), (np.inf, np.inf)),
+    )
+    lh, la = fixed.x
+    return lh, la, rho, float(np.linalg.norm(fixed.fun))
