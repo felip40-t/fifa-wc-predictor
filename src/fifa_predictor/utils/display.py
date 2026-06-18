@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from fifa_predictor.model.monte_carlo import select_headline_score
+from fifa_predictor.model.simulate import select_headline_score
 from fifa_predictor.utils.logging_config import get_logger
 
 logger = get_logger(__name__)

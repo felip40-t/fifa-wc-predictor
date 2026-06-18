@@ -22,7 +22,7 @@ The working pipeline turns bookmaker odds into simulated match outcomes:
    home/away and over/under prices. When a Pinnacle quarter line is available it
    is added as an extra, down-weighted total constraint that sharpens the
    goal-total shape without out-voting the draw.
-3. **Summarize each game** (`fifa_predictor.model.monte_carlo`): builds a
+3. **Summarize each game** (`fifa_predictor.model.simulate`): builds a
    Dixon-Coles scoreline matrix from the implied rates and reads the outcome
    probabilities and most likely scorelines directly off it (exact, no
    sampling), plus two point estimates: a result-consistent most likely score
@@ -159,7 +159,7 @@ For more control, call the function directly to set the `rho` starting guess
 `max_goals`:
 
 ```python
-from fifa_predictor.model.monte_carlo import simulate_games_from_odds
+from fifa_predictor.model.simulate import simulate_games_from_odds
 
 df = simulate_games_from_odds("data/raw/odds_world_cup_2026.csv")
 ```
@@ -192,8 +192,8 @@ make clean    # remove __pycache__ and .pytest_cache
 src/fifa_predictor/
 ├── data/      fetch_odds.py, fetch_results.py  (fetch_elo.py: stub;
 │              fetch_results year-range path: stub)
-├── model/     vig_removal.py, poisson_inversion.py, monte_carlo.py
-│              (dixon_coles.py: stub; monte_carlo.simulate_tournament: stub)
+├── model/     vig_removal.py, poisson_inversion.py, simulate.py
+│              (dixon_coles.py: stub; simulate.simulate_tournament: stub)
 └── utils/     logging_config.py, display.py, compare.py
 ```
 

@@ -8,14 +8,19 @@ Only games present in both frames (i.e. already played) appear.
 
 When the simulated-outcomes frame is also supplied it is joined by the same match
 string to surface each game's three most likely scorelines, so a near miss (the
-actual score sat in our top 3 but not our single headline pick) is visible.
+actual score sat in our top 3 but not our single headline pick) is visible. That
+frame also carries the model's outcome marginals and DC rates, which give two
+probabilities per game: the model's probability for the outcome that actually
+happened and for the exact actual scoreline.
 """
 
 import argparse
+import math
 from pathlib import Path
 
 import pandas as pd
 
+from fifa_predictor.model.poisson_inversion import scoreline_probabilities_dc
 from fifa_predictor.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -28,10 +33,25 @@ _COMPARISON_COLUMNS = [
     "exact_hit",
     "top3",
     "top3_hit",
+    "result_prob",
+    "score_prob",
 ]
 
 # How many ranked scorelines the simulated-outcomes CSV carries per game.
 _TOP_SCORELINES = 3
+
+# Goal ceiling used to rebuild a game's DC scoreline matrix from its stored
+# (lh, la, rho). Matches the default simulate_games_from_odds uses, so the
+# rebuilt matrix reproduces the one the outcomes were summarised from.
+_MAX_GOALS = 10
+
+# Maps an actual outcome (H/D/A) to the marginal-probability column that holds
+# the model's probability for that outcome.
+_OUTCOME_PROB_COLUMN = {
+    "H": "sim_p_home",
+    "D": "sim_p_draw",
+    "A": "sim_p_away",
+}
 
 
 def _score_outcome(home_score: int, away_score: int) -> str:
@@ -70,8 +90,11 @@ def build_comparison(
         A DataFrame in ``_COMPARISON_COLUMNS`` shape, one row per played game
         (present in both inputs): the matchup, the published predicted score, the
         actual score, boolean result_hit / exact_hit columns, the three most
-        likely scorelines, and a top3_hit flag. Empty (but typed) when no games
-        line up.
+        likely scorelines, a top3_hit flag, and two probabilities read off the
+        game's DC matrix: result_prob (the model's probability for the outcome
+        that actually happened) and score_prob (its probability for the exact
+        actual scoreline). The two probabilities are NaN when no outcomes source
+        is supplied. Empty (but typed) when no games line up.
     """
     predictions = _as_frame(predictions_source)
     results = _as_frame(results_source)
@@ -83,7 +106,7 @@ def build_comparison(
         )
         for _, row in results.iterrows()
     }
-    top3_by_match = _top3_by_match(outcomes_source)
+    outcomes_by_match = _outcomes_by_match(outcomes_source)
 
     rows = []
     for _, game in predictions.iterrows():
@@ -93,36 +116,72 @@ def build_comparison(
         home_score, away_score = actual
         predicted = game["score"]
         actual_str = f"{home_score}-{away_score}"
-        top3_scores = top3_by_match.get(game["match"], [])
+        outcome = _score_outcome(home_score, away_score)
+        info = outcomes_by_match.get(game["match"], {})
+        top3_scores = info.get("top3", [])
         rows.append(
             {
                 "match": game["match"],
                 "predicted": predicted,
                 "actual": actual_str,
-                "result_hit": _outcome_of(predicted) == _score_outcome(home_score, away_score),
+                "result_hit": _outcome_of(predicted) == outcome,
                 "exact_hit": predicted == actual_str,
                 "top3": " / ".join(top3_scores),
                 "top3_hit": actual_str in top3_scores,
+                "result_prob": _result_prob(info, outcome),
+                "score_prob": _score_prob(info, home_score, away_score),
             }
         )
 
     return pd.DataFrame(rows, columns=_COMPARISON_COLUMNS)
 
 
-def _top3_by_match(outcomes_source: "str | Path | pd.DataFrame | None") -> dict:
-    """Map each "Home vs Away" matchup to its ranked score_1..score_3 scorelines.
+def _result_prob(info: dict, outcome: str) -> float:
+    """Probability the model gave the outcome (H/D/A) that actually happened.
 
-    Returns an empty mapping when no outcomes frame is supplied, which leaves
-    every game's top-3 columns blank.
+    Reads the matching ``sim_p_home/draw/away`` marginal off the game's outcomes
+    row. Returns NaN when the marginals are absent (no outcomes source).
+    """
+    value = info.get(_OUTCOME_PROB_COLUMN[outcome])
+    return float(value) if value is not None and pd.notna(value) else math.nan
+
+
+def _score_prob(info: dict, home_score: int, away_score: int) -> float:
+    """Probability of the exact actual scoreline under the game's DC matrix.
+
+    Rebuilds the Dixon-Coles scoreline matrix from the stored (lh, la, rho),
+    normalises it, and reads cell [home_score, away_score]. Returns NaN when the
+    rates are absent (no outcomes source) and 0.0 when the scoreline sits beyond
+    the matrix's goal ceiling.
+    """
+    lh, la, rho = info.get("lh"), info.get("la"), info.get("rho")
+    if any(v is None or pd.isna(v) for v in (lh, la, rho)):
+        return math.nan
+    if home_score > _MAX_GOALS or away_score > _MAX_GOALS:
+        return 0.0
+    matrix = scoreline_probabilities_dc(float(lh), float(la), float(rho), _MAX_GOALS)
+    return float(matrix[home_score, away_score] / matrix.sum())
+
+
+def _outcomes_by_match(outcomes_source: "str | Path | pd.DataFrame | None") -> dict:
+    """Map each "Home vs Away" matchup to the outcome data compare reads.
+
+    Each value is a dict carrying the ranked ``top3`` scorelines plus, when the
+    columns are present, the ``sim_p_home/draw/away`` marginals and the
+    ``lh``/``la``/``rho`` rates used to rebuild the scoreline matrix. Returns an
+    empty mapping when no outcomes frame is supplied, which leaves every game's
+    top-3 and probability columns blank.
     """
     if outcomes_source is None:
         return {}
     outcomes = _as_frame(outcomes_source)
     score_cols = [f"score_{rank}" for rank in range(1, _TOP_SCORELINES + 1)]
+    prob_cols = ["sim_p_home", "sim_p_draw", "sim_p_away", "lh", "la", "rho"]
     return {
-        f"{row['home_team']} vs {row['away_team']}": [
-            row[col] for col in score_cols if pd.notna(row[col])
-        ]
+        f"{row['home_team']} vs {row['away_team']}": {
+            "top3": [row[col] for col in score_cols if pd.notna(row[col])],
+            **{col: row[col] for col in prob_cols if col in row},
+        }
         for _, row in outcomes.iterrows()
     }
 
@@ -135,16 +194,19 @@ def format_comparison(df: pd.DataFrame) -> str:
 
     Returns:
         A multi-line string: one row per game showing the matchup, predicted and
-        actual scores, a tick for result/exact/top-3 hits, and the three most
-        likely scorelines, followed by a summary line counting exact, result, and
-        top-3 hits out of the total. The TOP3 tick fires when the actual scoreline
-        was among the three most likely, even when the headline pick missed it.
+        actual scores, a tick for result/exact/top-3 hits, the model's percent
+        probability for the actual outcome (RES%) and the exact actual scoreline
+        (SCORE%), and the three most likely scorelines, followed by a summary line
+        counting exact, result, and top-3 hits out of the total. The TOP3 column
+        shows which of the three most likely scorelines the actual score was
+        (1, 2, or 3), or '.' when it was not among them. RES%/SCORE% show '.' when
+        no outcomes frame was supplied.
     """
     match_w = max([len("MATCHUP"), *(len(m) for m in df["match"])], default=len("MATCHUP"))
 
     header = (
         f"{'MATCHUP':<{match_w}}  {'PRED':>5}  {'ACTUAL':>6}  {'RESULT':>6}  {'EXACT':>5}  "
-        f"{'TOP3':>5}  TOP 3 SCORES"
+        f"{'TOP3':>5}  {'RES%':>6}  {'SCORE%':>6}  TOP 3 SCORES"
     )
     lines = [header, "-" * len(header)]
 
@@ -153,7 +215,9 @@ def format_comparison(df: pd.DataFrame) -> str:
             f"{row['match']:<{match_w}}  {row['predicted']:>5}  {row['actual']:>6}  "
             f"{('OK' if row['result_hit'] else '.'):>6}  "
             f"{('OK' if row['exact_hit'] else '.'):>5}  "
-            f"{('OK' if row['top3_hit'] else '.'):>5}  {row['top3']}"
+            f"{_top3_rank(row['top3'], row['actual']):>5}  "
+            f"{_format_pct(row.get('result_prob')):>6}  "
+            f"{_format_pct(row.get('score_prob')):>6}  {row['top3']}"
         )
 
     total = len(df)
@@ -198,6 +262,24 @@ def display_comparison(
     """Log the formatted prediction-vs-actual table as a single message."""
     df = build_comparison(predictions_source, results_source, outcomes_source)
     logger.info("Prediction vs actual:\n%s", format_comparison(df))
+
+
+def _top3_rank(top3: str, actual: str) -> str:
+    """Rank (1..3) of the actual scoreline within the ' / '-joined top-3, or '.'.
+
+    Returns the 1-based position of the actual score among the three most likely
+    scorelines, so a near miss shows which of the top 3 it was. '.' when the
+    actual score is not among them (or no top-3 was supplied).
+    """
+    scores = [s.strip() for s in top3.split(" / ") if s.strip()]
+    return str(scores.index(actual) + 1) if actual in scores else "."
+
+
+def _format_pct(value: "float | None") -> str:
+    """Render a probability in [0, 1] as a one-decimal percent, or '.' when absent."""
+    if value is None or pd.isna(value):
+        return "."
+    return f"{value * 100:.1f}%"
 
 
 def _as_frame(source: "str | Path | pd.DataFrame") -> pd.DataFrame:

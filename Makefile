@@ -34,7 +34,7 @@ results:
 # Override the competition with COMP, e.g. `make simulate COMP=world_cup_2026`.
 COMP ?= world_cup_2026
 simulate:
-	$(PYTHON) -m fifa_predictor.model.monte_carlo $(COMP)
+	$(PYTHON) -m fifa_predictor.model.simulate $(COMP)
 
 # Pretty-print the simulated outcomes CSV as an aligned, human-readable table
 report:

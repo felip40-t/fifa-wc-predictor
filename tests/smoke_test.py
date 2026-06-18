@@ -14,7 +14,7 @@ MODULES = [
     "fifa_predictor.model.vig_removal",
     "fifa_predictor.model.poisson_inversion",
     "fifa_predictor.model.dixon_coles",
-    "fifa_predictor.model.monte_carlo",
+    "fifa_predictor.model.simulate",
 ]
 
 

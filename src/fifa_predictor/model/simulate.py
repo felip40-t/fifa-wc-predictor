@@ -1,4 +1,4 @@
-"""Monte Carlo tournament simulation built on top of scoreline prediction models."""
+"""Scoreline prediction model."""
 
 import argparse
 import math
@@ -336,7 +336,7 @@ def simulate_tournament(
 def main() -> None:
     """Summarize a competition's games from its odds CSV and write the output.
 
-    Entry point for `python -m fifa_predictor.model.monte_carlo` (see the Makefile
+    Entry point for `python -m fifa_predictor.model.simulate` (see the Makefile
     `simulate` target). Reads `data/raw/odds_<competition>.csv` and writes
     `data/processed/simulated_outcomes_<competition>.csv`, showing a progress bar.
     """
