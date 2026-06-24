@@ -1,19 +1,27 @@
-"""Human-readable rendering of the simulated_outcomes CSV.
+"""Human-readable rendering of the predictor's processed outputs.
 
-The raw CSV is hard to scan: game-id hashes, full-precision goal rates, and
-probabilities as long decimals. This module turns one of those frames (or its
-CSV path) into an aligned, percentage-formatted table for reading at a glance.
+Turns the hard-to-scan processed files into aligned, at-a-glance tables:
+the simulated_outcomes CSV (goal rates and scoreline probabilities), the
+group_standings CSV, and the resolved knockout-bracket JSON.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
 
+from fifa_predictor.model.knockout import BRACKET_PATH
 from fifa_predictor.model.simulate import select_headline_score
 from fifa_predictor.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Round numbers occupied by the Round of 32 (the bracket's team-bearing leaves).
+_R32_MATCHES = range(73, 89)
+# Vertical rows between consecutive team leaves. Even spacing keeps every parent
+# match's mid-point row a whole number, so connectors land on exact rows.
+_LEAF_SPACING = 2
 
 # Above this 1X2 + over/under inversion residual, the implied goal rates fit the
 # bookmaker prices poorly; such rows are flagged so readers treat them with care.
@@ -134,15 +142,284 @@ def display_simulated_outcomes(source: "str | Path | pd.DataFrame") -> None:
     logger.info("Simulated outcomes:\n%s", format_simulated_outcomes(source))
 
 
-def main() -> None:
-    """Pretty-print a competition's simulated outcomes, or export predictions.
+def format_group_standings(source: "str | Path | pd.DataFrame") -> str:
+    """Build an aligned, group-by-group table of the resolved standings.
 
-    Entry point for `python -m fifa_predictor.utils.display`. Reads
-    `data/processed/simulated_outcomes_<competition>.csv`. With `--predict`, it
-    instead writes `data/processed/predictions_<competition>.csv` (match, score).
+    Args:
+        source: A standings DataFrame (as written by the knockout resolver) or a
+            path to the group_standings CSV. Expected columns: group, rank, team,
+            played, won, drawn, lost, gf, ga, gd, points, status.
+
+    Returns:
+        A multi-line string with one block per group, teams ordered by rank, a
+        dashed line after rank 2 marking the automatic-qualification cut, and
+        each group's status (final once all its games are played, else
+        projected) in the block header.
+    """
+    df = source if isinstance(source, pd.DataFrame) else pd.read_csv(source)
+
+    blocks = []
+    for letter in sorted(df["group"].unique()):
+        group = df[df["group"] == letter].sort_values("rank")
+        team_w = max(len("TEAM"), *(len(team) for team in group["team"]))
+        status = group["status"].iloc[0]
+
+        header = f"GROUP {letter}   ({status})"
+        columns = (
+            f"{'#':>2}  {'TEAM':<{team_w}}  {'P':>2} {'W':>2} {'D':>2} {'L':>2}  "
+            f"{'GF':>3} {'GA':>3} {'GD':>3}  {'PTS':>3}"
+        )
+        lines = [header, columns]
+        for _, row in group.iterrows():
+            lines.append(
+                f"{row['rank']:>2}  {row['team']:<{team_w}}  "
+                f"{row['played']:>2} {row['won']:>2} {row['drawn']:>2} {row['lost']:>2}  "
+                f"{row['gf']:>3} {row['ga']:>3} {row['gd']:>+3}  {row['points']:>3}"
+            )
+            if row["rank"] == 2:
+                lines.append("   " + "-" * (len(columns) - 3))
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+def _slot_label(team: str, status: str) -> str:
+    """A bracket team name, marked with ' *' while its slot is still projected."""
+    return team if status == "final" else f"{team} *"
+
+
+def format_round_of_32(source: "str | Path | dict") -> str:
+    """Build an aligned table of the resolved Round of 32.
+
+    Args:
+        source: A resolved-bracket dict (as written by the knockout resolver) or
+            a path to the knockout_bracket_resolved JSON. Expected keys:
+            round_of_32 (list of match dicts with home/away and *_status) and
+            optionally qualifying_third_place_groups.
+
+    Returns:
+        A multi-line string, one row per match (`M73  Home  vs  Away`). Slots
+        whose team is not yet locked are marked with a trailing '*', explained in
+        a footnote; the qualifying third-place groups are shown in the header
+        when present.
+    """
+    data = source if isinstance(source, dict) else json.loads(Path(source).read_text())
+    matches = data["round_of_32"]
+
+    homes = [_slot_label(m["home"], m["home_status"]) for m in matches]
+    aways = [_slot_label(m["away"], m["away_status"]) for m in matches]
+    home_w = max(len("HOME"), *(len(home) for home in homes))
+
+    title = "ROUND OF 32"
+    groups = data.get("qualifying_third_place_groups")
+    if groups:
+        title += f"   (best third-placed groups: {' '.join(groups)})"
+    lines = [title, "-" * len(title)]
+
+    for match, home, away in zip(matches, homes, aways):
+        lines.append(f"  M{match['match']:<3} {home:>{home_w}}  vs  {away}")
+
+    projected = any(m["home_status"] != "final" or m["away_status"] != "final" for m in matches)
+    if projected:
+        lines.append("")
+        lines.append("* slot not yet locked (depends on games still to be played)")
+
+    return "\n".join(lines)
+
+
+def _bracket_children(structure: dict) -> dict[int, tuple[int, int]]:
+    """Map each non-R32 match to its two feeder match numbers (home, away).
+
+    Reads the predetermined connections (round_of_16 .. final), whose slots are
+    "W##" tokens, into {match: (home_feeder, away_feeder)}.
+    """
+    children: dict[int, tuple[int, int]] = {}
+    for rnd in ("round_of_16", "quarter_finals", "semi_finals", "final"):
+        for match in structure["bracket"][rnd]:
+            children[match["match"]] = (int(match["home"][1:]), int(match["away"][1:]))
+    return children
+
+
+class _Canvas:
+    """A fixed-size grid of characters with simple text/glyph placement."""
+
+    def __init__(self, height: int, width: int) -> None:
+        self._grid = [[" "] * width for _ in range(height)]
+
+    def text(self, row: int, col: int, value: str) -> None:
+        for offset, char in enumerate(value):
+            self._set(row, col + offset, char)
+
+    def _set(self, row: int, col: int, char: str) -> None:
+        if 0 <= row < len(self._grid) and 0 <= col < len(self._grid[0]):
+            self._grid[row][col] = char
+
+    def render(self) -> str:
+        return "\n".join("".join(row).rstrip() for row in self._grid).rstrip("\n")
+
+
+def format_bracket(
+    resolved_source: "str | Path | dict",
+    structure_source: "str | Path | dict" = BRACKET_PATH,
+) -> str:
+    """Draw the knockout as a single-sided left-to-right bracket tree.
+
+    All 32 Round-of-32 teams stack vertically on the left; each match's winner
+    feeds rightward through R16, QF, SF, to the Final. Later rounds are not yet
+    decided, so their slots show "W##" (winner of match ##). Round-of-32 teams
+    whose slot is not yet locked are marked with a trailing "*".
+
+    Args:
+        resolved_source: A resolved-bracket dict (as written by the knockout
+            resolver) or a path to the knockout_bracket_resolved JSON. Supplies
+            the Round-of-32 team names and their final/projected statuses.
+        structure_source: The reference knockout_bracket.json (dict or path) that
+            carries the round-to-round connections. Defaults to the packaged file.
+
+    Returns:
+        A multi-line string holding the bracket, a column header per round, and a
+        footnote when any slot is still projected.
+    """
+    resolved = (
+        resolved_source
+        if isinstance(resolved_source, dict)
+        else json.loads(Path(resolved_source).read_text())
+    )
+    structure = (
+        structure_source
+        if isinstance(structure_source, dict)
+        else json.loads(Path(structure_source).read_text())
+    )
+
+    children = _bracket_children(structure)
+    final_match = structure["bracket"]["final"][0]["match"]
+
+    teams = {}
+    projected = False
+    for match in resolved["round_of_32"]:
+        labels = []
+        for side in ("home", "away"):
+            locked = match[f"{side}_status"] == "final"
+            projected = projected or not locked
+            labels.append(match[side] if locked else f"{match[side]} *")
+        teams[match["match"]] = tuple(labels)
+
+    # Column index per round, left (teams) to right (champion).
+    col_of = {"r32": 1, "r16": 2, "qf": 3, "sf": 4, "final": 5}
+    round_of = {}
+    for match in range(73, 89):
+        round_of[match] = "r32"
+    for rnd, name in (("round_of_16", "r16"), ("quarter_finals", "qf"),
+                      ("semi_finals", "sf"), ("final", "final")):
+        for match in structure["bracket"][rnd]:
+            round_of[match["match"]] = name
+
+    team_w = max(len(label) for pair in teams.values() for label in pair)
+    node_w = len(f"W{final_match}")
+    pad = 4
+    x_of_col = [0]
+    x_of_col.append(team_w + pad)
+    for _ in range(4):
+        x_of_col.append(x_of_col[-1] + node_w + pad)
+
+    # Assign rows: leaves get evenly spaced rows; each match sits at the midpoint
+    # of its two children.
+    next_leaf_row = [0]
+    node_row: dict[int, int] = {}
+    leaf_rows: dict[int, tuple[int, int]] = {}
+
+    def layout(match: int) -> int:
+        if match in _R32_MATCHES:
+            row_home = next_leaf_row[0]
+            row_away = row_home + _LEAF_SPACING
+            next_leaf_row[0] = row_away + _LEAF_SPACING
+            leaf_rows[match] = (row_home, row_away)
+            row = (row_home + row_away) // 2
+        else:
+            home, away = children[match]
+            row = (layout(home) + layout(away)) // 2
+        node_row[match] = row
+        return row
+
+    layout(final_match)
+
+    height = next_leaf_row[0]
+    canvas = _Canvas(height, x_of_col[5] + node_w)
+
+    def connect(row_top: int, row_bottom: int, row_parent: int,
+                child_right: int, parent_x: int) -> None:
+        elbow = child_right + 2
+        for row in (row_top, row_bottom):
+            for col in range(child_right, elbow):
+                canvas._set(row, col, "─")
+        canvas._set(row_top, elbow, "┐")
+        canvas._set(row_bottom, elbow, "┘")
+        for row in range(row_top + 1, row_bottom):
+            canvas._set(row, elbow, "│")
+        canvas._set(row_parent, elbow, "├")
+        for col in range(elbow + 1, parent_x):
+            canvas._set(row_parent, col, "─")
+
+    # Draw teams (right-aligned to the R32 column) and their match connectors.
+    for match, (row_home, row_away) in leaf_rows.items():
+        home, away = teams[match]
+        canvas.text(row_home, team_w - len(home), home)
+        canvas.text(row_away, team_w - len(away), away)
+        connect(row_home, row_away, node_row[match], team_w, x_of_col[1])
+        canvas.text(node_row[match], x_of_col[1], f"W{match}")
+
+    # Draw the winner nodes for R16, QF, SF, and the Final, with their connectors.
+    for match, col_name in round_of.items():
+        if col_name == "r32":
+            continue
+        col = col_of[col_name]
+        home, away = children[match]
+        child_right = x_of_col[col - 1] + node_w
+        connect(node_row[home], node_row[away], node_row[match], child_right, x_of_col[col])
+        canvas.text(node_row[match], x_of_col[col], f"W{match}")
+
+    header_cells = [("r32", "R32"), ("r16", "R16"), ("qf", "QF"), ("sf", "SF"),
+                    ("final", "FINAL")]
+    header = " " * x_of_col[1]
+    for col_name, title in header_cells:
+        header = header.ljust(x_of_col[col_of[col_name]]) + title
+
+    lines = [header, canvas.render()]
+    if projected:
+        lines.append("")
+        lines.append("W## = winner of match ##; * = slot not yet locked")
+    return "\n".join(lines)
+
+
+def display_bracket(
+    resolved_source: "str | Path | dict",
+    structure_source: "str | Path | dict" = BRACKET_PATH,
+) -> None:
+    """Log the formatted bracket tree as a single message."""
+    logger.info("Knockout bracket:\n%s", format_bracket(resolved_source, structure_source))
+
+
+def display_group_standings(source: "str | Path | pd.DataFrame") -> None:
+    """Log the formatted group-standings table as a single message."""
+    logger.info("Group standings:\n%s", format_group_standings(source))
+
+
+def display_round_of_32(source: "str | Path | dict") -> None:
+    """Log the formatted Round of 32 table as a single message."""
+    logger.info("Round of 32:\n%s", format_round_of_32(source))
+
+
+def main() -> None:
+    """Pretty-print a competition's processed outputs, or export predictions.
+
+    Entry point for `python -m fifa_predictor.utils.display`. By default renders
+    `data/processed/simulated_outcomes_<competition>.csv`. Flags switch the view:
+    `--predict` writes `data/processed/predictions_<competition>.csv` (match,
+    score); `--standings` renders `group_standings_<competition>.csv`;
+    `--bracket` renders `knockout_bracket_resolved_<competition>.json`.
     """
     parser = argparse.ArgumentParser(
-        description="Render simulated outcomes, or export a predictions CSV."
+        description="Render simulated outcomes, standings, or the bracket; or export predictions."
     )
     parser.add_argument("competition", nargs="?", default="world_cup_2026")
     parser.add_argument(
@@ -150,13 +427,30 @@ def main() -> None:
         action="store_true",
         help="Write the two-column predictions CSV instead of printing the table.",
     )
+    parser.add_argument(
+        "--standings",
+        action="store_true",
+        help="Render the resolved group_standings CSV instead of simulated outcomes.",
+    )
+    parser.add_argument(
+        "--bracket",
+        action="store_true",
+        help="Render the resolved Round of 32 JSON instead of simulated outcomes.",
+    )
     args = parser.parse_args()
 
-    source = f"data/processed/simulated_outcomes_{args.competition}.csv"
+    processed = "data/processed"
     if args.predict:
-        export_predictions(source, f"data/processed/predictions_{args.competition}.csv")
+        export_predictions(
+            f"{processed}/simulated_outcomes_{args.competition}.csv",
+            f"{processed}/predictions_{args.competition}.csv",
+        )
+    elif args.standings:
+        display_group_standings(f"{processed}/group_standings_{args.competition}.csv")
+    elif args.bracket:
+        display_bracket(f"{processed}/knockout_bracket_resolved_{args.competition}.json")
     else:
-        display_simulated_outcomes(source)
+        display_simulated_outcomes(f"{processed}/simulated_outcomes_{args.competition}.csv")
 
 
 if __name__ == "__main__":

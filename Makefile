@@ -1,7 +1,7 @@
 # Interpreter for all targets. Override for CI, e.g. `make test PYTHON=python`.
 PYTHON ?= .venv/bin/python
 
-.PHONY: install test smoke lint format clean odds results simulate report predict compare
+.PHONY: install test smoke lint format clean odds results simulate report predict compare knockout standings bracket
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -48,3 +48,15 @@ predict:
 # writes data/processed/comparison_<comp>.csv
 compare:
 	$(PYTHON) -m fifa_predictor.utils.compare $(COMP) --export
+
+# Resolve group standings + fill the Round of 32 from results + predictions
+knockout:
+	$(PYTHON) -m fifa_predictor.model.knockout $(COMP)
+
+# Pretty-print the resolved group standings
+standings:
+	$(PYTHON) -m fifa_predictor.utils.display $(COMP) --standings
+
+# Pretty-print the resolved Round of 32 bracket
+bracket:
+	$(PYTHON) -m fifa_predictor.utils.display $(COMP) --bracket

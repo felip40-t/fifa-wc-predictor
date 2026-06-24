@@ -2,10 +2,31 @@
 
 import pandas as pd
 
+from fifa_predictor.model.knockout import load_bracket
 from fifa_predictor.utils.display import (
     POOR_FIT_THRESHOLD,
+    format_bracket,
+    format_group_standings,
+    format_round_of_32,
     format_simulated_outcomes,
 )
+
+
+def _resolved_from_structure(projected_first: bool = False) -> dict:
+    """A resolved-bracket dict for all 16 R32 matches, teams named by match id."""
+    rows = load_bracket()["bracket"]["round_of_32"]
+    return {
+        "round_of_32": [
+            {
+                "match": m["match"],
+                "home": f"H{m['match']}",
+                "away": f"A{m['match']}",
+                "home_status": "projected" if (projected_first and i == 0) else "final",
+                "away_status": "final",
+            }
+            for i, m in enumerate(rows)
+        ]
+    }
 
 
 def _frame() -> pd.DataFrame:
@@ -81,6 +102,59 @@ def test_poor_fit_rows_are_flagged() -> None:
 def test_well_fit_rows_have_no_flag_footnote() -> None:
     out = format_simulated_outcomes(_frame())
     assert "caution" not in out
+
+
+def _standings_frame() -> pd.DataFrame:
+    """A two-team group mirroring the group_standings CSV schema."""
+    return pd.DataFrame(
+        [
+            {"group": "A", "rank": 1, "team": "Mexico", "played": 3, "won": 3,
+             "drawn": 0, "lost": 0, "gf": 4, "ga": 0, "gd": 4, "points": 9,
+             "status": "projected"},
+            {"group": "A", "rank": 2, "team": "South Korea", "played": 3, "won": 2,
+             "drawn": 0, "lost": 1, "gf": 3, "ga": 2, "gd": 1, "points": 6,
+             "status": "projected"},
+        ]
+    )
+
+
+def test_format_group_standings_shows_group_teams_and_signed_gd() -> None:
+    out = format_group_standings(_standings_frame())
+    assert "GROUP A   (projected)" in out
+    assert "Mexico" in out and "South Korea" in out
+    assert "+4" in out  # goal difference is signed
+    assert "----" in out  # qualification cut line drawn after rank 2
+
+
+def test_format_round_of_32_marks_projected_slots() -> None:
+    data = {
+        "qualifying_third_place_groups": ["B", "C", "D", "F", "I", "J", "K", "L"],
+        "round_of_32": [
+            {"match": 73, "home": "South Korea", "away": "Switzerland",
+             "home_status": "final", "away_status": "projected"},
+        ],
+    }
+    out = format_round_of_32(data)
+    assert "M73" in out
+    assert "South Korea" in out  # final slot: no marker
+    assert "Switzerland *" in out  # projected slot: trailing marker
+    assert "best third-placed groups: B C D F I J K L" in out
+    assert "not yet locked" in out
+
+
+def test_format_bracket_renders_all_rounds_as_a_tree() -> None:
+    out = format_bracket(_resolved_from_structure(), load_bracket())
+    assert "H74" in out and "A74" in out  # an R32 team pair (leaves)
+    assert "W74" in out and "W89" in out  # R32 and R16 winner nodes
+    assert "W101" in out and "W104" in out  # SF and final nodes
+    assert "├" in out and "┐" in out  # bracket connector glyphs
+    assert "not yet locked" not in out  # every slot final -> no footnote
+
+
+def test_format_bracket_marks_projected_slots() -> None:
+    out = format_bracket(_resolved_from_structure(projected_first=True), load_bracket())
+    assert "*" in out
+    assert "not yet locked" in out
 
 
 def test_reads_from_a_csv_path(tmp_path) -> None:
