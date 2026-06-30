@@ -47,12 +47,16 @@ def _top_scores(row: "pd.Series") -> str:
     return "   ".join(parts)
 
 
-def format_simulated_outcomes(source: "str | Path | pd.DataFrame") -> str:
+def format_simulated_outcomes(
+    source: "str | Path | pd.DataFrame", played_ids: "set | None" = None
+) -> str:
     """Build an aligned, human-readable table of simulated match outcomes.
 
     Args:
         source: Either an already-loaded summary DataFrame (as returned by
             simulate_games_from_odds) or a path to the simulated_outcomes CSV.
+        played_ids: Optional set of game_ids already played. When supplied, those
+            rows are dropped so the table shows only games yet to be played.
 
     Returns:
         A multi-line string: one row per game with the matchup, implied goal
@@ -64,6 +68,8 @@ def format_simulated_outcomes(source: "str | Path | pd.DataFrame") -> str:
         omitted.
     """
     df = source if isinstance(source, pd.DataFrame) else pd.read_csv(source)
+    if played_ids:
+        df = df[~df["game_id"].isin(played_ids)].reset_index(drop=True)
 
     matchups = [f"{home} vs {away}" for home, away in zip(df["home_team"], df["away_team"])]
     flagged = [residual > POOR_FIT_THRESHOLD for residual in df["residual_norm"]]
@@ -133,13 +139,29 @@ def export_predictions(
     return predictions
 
 
-def display_simulated_outcomes(source: "str | Path | pd.DataFrame") -> None:
+def display_simulated_outcomes(
+    source: "str | Path | pd.DataFrame", played_ids: "set | None" = None
+) -> None:
     """Log the formatted simulated-outcomes table as a single message.
 
     Args:
         source: A summary DataFrame or a path to the simulated_outcomes CSV.
+        played_ids: Optional set of game_ids to drop so only games still to be
+            played are shown.
     """
-    logger.info("Simulated outcomes:\n%s", format_simulated_outcomes(source))
+    logger.info("Simulated outcomes:\n%s", format_simulated_outcomes(source, played_ids))
+
+
+def _played_game_ids(results_path: "str | Path") -> set:
+    """Game_ids of already-played games, read from the results CSV.
+
+    Returns an empty set when the results file is absent, so the report falls
+    back to showing every game.
+    """
+    path = Path(results_path)
+    if not path.exists():
+        return set()
+    return set(pd.read_csv(path)["game_id"])
 
 
 def format_group_standings(source: "str | Path | pd.DataFrame") -> str:
@@ -296,6 +318,10 @@ def format_bracket(
 
     teams = {}
     projected = False
+    advanced = False
+    # Leftmost winner column: show the team that advanced from a played result,
+    # else the abstract "W##" token for a match still to be decided.
+    r32_winner_label: dict[int, str] = {}
     for match in resolved["round_of_32"]:
         labels = []
         for side in ("home", "away"):
@@ -303,6 +329,12 @@ def format_bracket(
             projected = projected or not locked
             labels.append(match[side] if locked else f"{match[side]} *")
         teams[match["match"]] = tuple(labels)
+        winner = match.get("winner")
+        if winner:
+            r32_winner_label[match["match"]] = winner
+            advanced = True
+        else:
+            r32_winner_label[match["match"]] = f"W{match['match']}"
 
     # Column index per round, left (teams) to right (champion).
     col_of = {"r32": 1, "r16": 2, "qf": 3, "sf": 4, "final": 5}
@@ -316,11 +348,14 @@ def format_bracket(
 
     team_w = max(len(label) for pair in teams.values() for label in pair)
     node_w = len(f"W{final_match}")
+    # The R32-winner column can hold team names, so it is sized to its widest
+    # label; later columns only ever hold "W##" nodes of width node_w.
+    r32win_w = max(node_w, *(len(label) for label in r32_winner_label.values()))
+    width_of_col = [team_w, r32win_w, node_w, node_w, node_w, node_w]
     pad = 4
     x_of_col = [0]
-    x_of_col.append(team_w + pad)
-    for _ in range(4):
-        x_of_col.append(x_of_col[-1] + node_w + pad)
+    for prev in range(5):
+        x_of_col.append(x_of_col[-1] + width_of_col[prev] + pad)
 
     # Assign rows: leaves get evenly spaced rows; each match sits at the midpoint
     # of its two children.
@@ -366,7 +401,7 @@ def format_bracket(
         canvas.text(row_home, team_w - len(home), home)
         canvas.text(row_away, team_w - len(away), away)
         connect(row_home, row_away, node_row[match], team_w, x_of_col[1])
-        canvas.text(node_row[match], x_of_col[1], f"W{match}")
+        canvas.text(node_row[match], x_of_col[1], r32_winner_label[match])
 
     # Draw the winner nodes for R16, QF, SF, and the Final, with their connectors.
     for match, col_name in round_of.items():
@@ -374,20 +409,36 @@ def format_bracket(
             continue
         col = col_of[col_name]
         home, away = children[match]
-        child_right = x_of_col[col - 1] + node_w
+        child_right = x_of_col[col - 1] + width_of_col[col - 1]
         connect(node_row[home], node_row[away], node_row[match], child_right, x_of_col[col])
         canvas.text(node_row[match], x_of_col[col], f"W{match}")
 
-    header_cells = [("r32", "R32"), ("r16", "R16"), ("qf", "QF"), ("sf", "SF"),
-                    ("final", "FINAL")]
-    header = " " * x_of_col[1]
-    for col_name, title in header_cells:
-        header = header.ljust(x_of_col[col_of[col_name]]) + title
+    # Each column header names the round its teams are IN: the leaf teams played
+    # the Round of 32, the winner beside them has reached the Round of 16, and so
+    # on through to the final's winner (the champion).
+    header_titles = [
+        (max(0, team_w - len("R32")), "R32"),  # right-aligned over the team column
+        (x_of_col[1], "R16"),
+        (x_of_col[2], "QF"),
+        (x_of_col[3], "SF"),
+        (x_of_col[4], "FINAL"),
+        (x_of_col[5], "CHAMPION"),
+    ]
+    header = ""
+    for x, title in header_titles:
+        header = header.ljust(x) + title
 
     lines = [header, canvas.render()]
+    notes = []
+    if advanced:
+        notes.append("named team in the R32 column = advanced from a result")
+    if projected or advanced:
+        notes.append("W## = winner of match ## (still to be decided)")
     if projected:
+        notes.append("* = slot not yet locked")
+    if notes:
         lines.append("")
-        lines.append("W## = winner of match ##; * = slot not yet locked")
+        lines.append("; ".join(notes))
     return "\n".join(lines)
 
 
@@ -413,10 +464,13 @@ def main() -> None:
     """Pretty-print a competition's processed outputs, or export predictions.
 
     Entry point for `python -m fifa_predictor.utils.display`. By default renders
-    `data/processed/simulated_outcomes_<competition>.csv`. Flags switch the view:
-    `--predict` writes `data/processed/predictions_<competition>.csv` (match,
-    score); `--standings` renders `group_standings_<competition>.csv`;
-    `--bracket` renders `knockout_bracket_resolved_<competition>.json`.
+    the still-to-be-played games from
+    `data/processed/simulated_outcomes_<competition>.csv`, hiding games already
+    in `data/raw/results_<competition>.csv` (pass `--all` to show every game).
+    Flags switch the view: `--predict` writes
+    `data/processed/predictions_<competition>.csv` (match, score); `--standings`
+    renders `group_standings_<competition>.csv`; `--bracket` renders
+    `knockout_bracket_resolved_<competition>.json`.
     """
     parser = argparse.ArgumentParser(
         description="Render simulated outcomes, standings, or the bracket; or export predictions."
@@ -426,6 +480,11 @@ def main() -> None:
         "--predict",
         action="store_true",
         help="Write the two-column predictions CSV instead of printing the table.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include games already played in the outcomes table (default hides them).",
     )
     parser.add_argument(
         "--standings",
@@ -450,7 +509,12 @@ def main() -> None:
     elif args.bracket:
         display_bracket(f"{processed}/knockout_bracket_resolved_{args.competition}.json")
     else:
-        display_simulated_outcomes(f"{processed}/simulated_outcomes_{args.competition}.csv")
+        played = set()
+        if not args.all:
+            played = _played_game_ids(f"data/raw/results_{args.competition}.csv")
+        display_simulated_outcomes(
+            f"{processed}/simulated_outcomes_{args.competition}.csv", played
+        )
 
 
 if __name__ == "__main__":

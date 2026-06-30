@@ -32,6 +32,7 @@ _RESULT_COLUMNS = [
     "away_team",
     "home_score",
     "away_score",
+    "winner",
 ]
 
 
@@ -106,12 +107,30 @@ def _parse_score_event(event: dict) -> dict | None:
     }
 
 
+def _resolve_winner(row: dict) -> object:
+    """Winner for one result row: keep an entered value, else derive from the score.
+
+    A decisive score names its own winner; a level score (the only outcome that
+    goes to extra time or penalties) leaves the winner blank to be recorded by
+    hand, and that hand-entered value is preserved here on later rebuilds.
+    """
+    existing = row.get("winner")
+    if existing is not None and not pd.isna(existing) and str(existing).strip():
+        return existing
+    hs, as_ = row.get("home_score"), row.get("away_score")
+    if pd.isna(hs) or pd.isna(as_) or hs == as_:
+        return pd.NA
+    return row["home_team"] if hs > as_ else row["away_team"]
+
+
 def _build_results_frame(rows: list[dict]) -> pd.DataFrame:
     """Assemble result rows into a typed frame sorted by ascending commence_time."""
     df = pd.DataFrame(rows, columns=_RESULT_COLUMNS)
     df["commence_time"] = pd.to_datetime(df["commence_time"], utc=True)
     for col in ("home_score", "away_score"):
         df[col] = df[col].astype("Int64")
+    df["winner"] = [_resolve_winner(r) for r in df.to_dict("records")]
+    df["winner"] = df["winner"].astype("object")
     return df.sort_values("commence_time", ignore_index=True)
 
 

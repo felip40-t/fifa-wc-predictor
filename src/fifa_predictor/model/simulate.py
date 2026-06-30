@@ -65,6 +65,27 @@ def _row_value(row, key: str) -> float:
         return float("nan")
 
 
+# Odds fields the inversion requires; a row missing any of them cannot be solved.
+_REQUIRED_ODDS_FIELDS = (
+    "pinnacle_h2h_home",
+    "pinnacle_h2h_draw",
+    "pinnacle_h2h_away",
+    "pinnacle_ou_line",
+    "pinnacle_ou_over",
+    "pinnacle_ou_under",
+)
+
+
+def _row_is_priced(row) -> bool:
+    """True if a row carries every odds field the inversion needs.
+
+    Confirmed-but-unpriced games (e.g. knockout matchups the books have not
+    posted markets for yet) arrive with NaN odds; those rows cannot be inverted
+    and are skipped rather than crashing the solve.
+    """
+    return not any(pd.isna(_row_value(row, field)) for field in _REQUIRED_ODDS_FIELDS)
+
+
 def _implied_rates_from_odds_row(
     row, rho: float, max_goals: int
 ) -> tuple[float, float, float, float]:
@@ -248,26 +269,86 @@ def _game_outcomes(lh: float, la: float, rho: float, max_goals: int) -> dict:
     return outcomes
 
 
+def _played_game_ids(results_csv_path: str | None) -> set:
+    """Game ids already played, read from the results CSV.
+
+    Returns an empty set when no path is given or the file is absent, so a fresh
+    run (or one without results yet) simply treats every game as still to come.
+    """
+    if results_csv_path is None or not Path(results_csv_path).exists():
+        return set()
+    return set(pd.read_csv(results_csv_path)["game_id"])
+
+
+def _merge_into_existing(
+    new_records: list[dict], odds: pd.DataFrame, output_csv_path: str
+) -> pd.DataFrame:
+    """Merge freshly computed rows into the existing summary CSV.
+
+    Updating rather than rewriting keeps rows we deliberately did not recompute:
+    played games (carried over from a prior run) and any hand-added games whose
+    game_id is absent from the odds file. The frame is assembled in odds order,
+    preferring a fresh record when present, then falling back to the existing
+    row; manual rows not in the odds file are appended at the end.
+
+    Args:
+        new_records: The rows computed this run, keyed downstream by game_id.
+        odds: The odds frame, used to order the merged output.
+        output_csv_path: Path to the existing summary CSV (may not exist yet).
+
+    Returns:
+        The merged summary DataFrame.
+    """
+    fresh = {record["game_id"]: record for record in new_records}
+
+    existing_path = Path(output_csv_path)
+    existing_by_id: dict = {}
+    if existing_path.exists():
+        existing = pd.read_csv(existing_path)
+        existing_by_id = {row["game_id"]: row.to_dict() for _, row in existing.iterrows()}
+
+    merged: list[dict] = []
+    for game_id in odds["game_id"]:
+        if game_id in fresh:
+            merged.append(fresh[game_id])
+        elif game_id in existing_by_id:
+            merged.append(existing_by_id[game_id])
+
+    # Hand-added rows whose game_id never appears in the odds file are preserved
+    # at the end so a manual game survives a re-run.
+    odds_ids = set(odds["game_id"])
+    for game_id, row in existing_by_id.items():
+        if game_id not in odds_ids and game_id not in fresh:
+            merged.append(row)
+
+    return pd.DataFrame.from_records(merged)
+
+
 def simulate_games_from_odds(
     odds_csv_path: str,
     output_csv_path: str | None = None,
+    results_csv_path: str | None = None,
     rho: float = -0.13,
     max_goals: int = 10,
     progress: bool = False,
 ) -> pd.DataFrame:
-    """Summarize every game in an odds CSV.
+    """Summarize the still-to-be-played games in an odds CSV.
 
-    Reads the odds CSV, inverts each row to implied DC goal rates, and reads the
-    outcome summary directly off the exact DC scoreline matrix, assembling a
-    one-row-per-game summary frame. The summary is analytic (no per-game
-    sampling), so it is deterministic. Games with a poor inversion fit are still
-    included; residual_norm is surfaced so callers can flag or filter them
-    downstream.
+    Reads the odds CSV, inverts each unplayed, priced row to implied DC goal
+    rates, and reads the outcome summary directly off the exact DC scoreline
+    matrix. Games whose game_id is already in the results CSV are skipped (their
+    result is known), as are unpriced rows. The freshly computed rows are merged
+    into the existing summary CSV rather than overwriting it, so played games and
+    hand-added games carry over from earlier runs. The summary is analytic (no
+    per-game sampling), so it is deterministic.
 
     Args:
         odds_csv_path: Path to the odds CSV (e.g. data/raw/odds_world_cup_2026.csv).
         output_csv_path: Where to write the summary CSV. Defaults to
             data/processed/simulated_outcomes_world_cup_2026.csv.
+        results_csv_path: Path to the results CSV whose game_ids mark played
+            games to skip. When None or absent, every game is treated as still
+            to be played (the original whole-slate behavior).
         rho: Starting seed for the per-game fitted Dixon-Coles correlation. The
             fitted value (one per game) is surfaced in the output.
         max_goals: Maximum number of goals to consider per team.
@@ -275,19 +356,34 @@ def simulate_games_from_odds(
             per game). Off by default so library use and tests stay quiet.
 
     Returns:
-        The summary DataFrame (also written to output_csv_path).
+        The merged summary DataFrame (also written to output_csv_path).
     """
     if output_csv_path is None:
         output_csv_path = "data/processed/simulated_outcomes_world_cup_2026.csv"
 
     odds = pd.read_csv(odds_csv_path)
+    played = _played_game_ids(results_csv_path)
 
     rows = odds.iterrows()
     if progress:
         rows = tqdm(rows, total=len(odds), desc="Simulating", unit="game")
 
     records = []
+    skipped_unpriced = 0
+    skipped_played = 0
     for _, row in rows:
+        if row["game_id"] in played:
+            skipped_played += 1
+            continue
+        if not _row_is_priced(row):
+            skipped_unpriced += 1
+            logger.warning(
+                "Skipping unpriced game %s (%s vs %s): no odds posted yet",
+                row["game_id"],
+                row["home_team"],
+                row["away_team"],
+            )
+            continue
         lh, la, rho_used, residual_norm = _implied_rates_from_odds_row(row, rho, max_goals)
         # Build the scoreline matrix at the same fitted rho returned by the
         # inversion so the simulated outcomes stay consistent with the solve.
@@ -305,13 +401,17 @@ def simulate_games_from_odds(
             }
         )
 
-    summary = pd.DataFrame.from_records(records)
+    summary = _merge_into_existing(records, odds, output_csv_path)
     Path(output_csv_path).parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(output_csv_path, index=False)
     logger.info(
-        "Summarized %d games analytically -> %s",
-        len(summary),
+        "Simulated %d unplayed game(s) (%d played, %d unpriced skipped); "
+        "merged into %s (%d rows total)",
+        len(records),
+        skipped_played,
+        skipped_unpriced,
         output_csv_path,
+        len(summary),
     )
     return summary
 

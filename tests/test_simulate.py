@@ -232,6 +232,121 @@ def test_simulate_games_from_odds_shape_columns_and_probabilities(tmp_path) -> N
     np.testing.assert_allclose(prob_sums.to_numpy(), 1.0, atol=1e-9)
 
 
+def _unpriced_odds_row() -> dict:
+    """A confirmed-but-unpriced knockout game: all odds NaN (no market yet)."""
+    return {
+        "game_id": "g3",
+        "home_team": "Echo",
+        "away_team": "Foxtrot",
+        "commence_time": "2026-07-02 00:00:00+00:00",
+        "pinnacle_h2h_home": float("nan"),
+        "pinnacle_h2h_draw": float("nan"),
+        "pinnacle_h2h_away": float("nan"),
+        "pinnacle_ou_line": float("nan"),
+        "pinnacle_ou_over": float("nan"),
+        "pinnacle_ou_under": float("nan"),
+        "odds_source": "consensus",
+    }
+
+
+def test_simulate_games_from_odds_skips_unpriced_rows(tmp_path) -> None:
+    """An unpriced (all-NaN) row is skipped, not crashed on; priced rows survive."""
+    frame = pd.concat(
+        [_two_row_odds_frame(), pd.DataFrame([_unpriced_odds_row()])],
+        ignore_index=True,
+    )
+    odds_csv = tmp_path / "odds.csv"
+    frame.to_csv(odds_csv, index=False)
+
+    result = simulate.simulate_games_from_odds(
+        str(odds_csv),
+        output_csv_path=str(tmp_path / "out.csv"),
+    )
+
+    assert list(result["game_id"]) == ["g1", "g2"]
+
+
+def _results_frame(game_ids) -> pd.DataFrame:
+    """A minimal results frame marking the given game_ids as played."""
+    return pd.DataFrame(
+        [
+            {
+                "game_id": gid,
+                "commence_time": "2026-06-11 19:00:00+00:00",
+                "home_team": "X",
+                "away_team": "Y",
+                "home_score": 1,
+                "away_score": 0,
+            }
+            for gid in game_ids
+        ]
+    )
+
+
+def test_simulate_skips_played_games(tmp_path) -> None:
+    """Games whose game_id is in the results CSV are not recomputed."""
+    odds_csv = tmp_path / "odds.csv"
+    _two_row_odds_frame().to_csv(odds_csv, index=False)
+    results_csv = tmp_path / "results.csv"
+    _results_frame(["g1"]).to_csv(results_csv, index=False)
+
+    result = simulate.simulate_games_from_odds(
+        str(odds_csv),
+        output_csv_path=str(tmp_path / "out.csv"),
+        results_csv_path=str(results_csv),
+    )
+
+    assert list(result["game_id"]) == ["g2"]
+
+
+def test_simulate_merge_preserves_played_and_replaces_future(tmp_path) -> None:
+    """Merging keeps the existing played row but recomputes the future row."""
+    odds_csv = tmp_path / "odds.csv"
+    _two_row_odds_frame().to_csv(odds_csv, index=False)
+    out = tmp_path / "out.csv"
+
+    # Initial full run (no results yet) writes both games.
+    simulate.simulate_games_from_odds(str(odds_csv), output_csv_path=str(out))
+
+    # Sentinel both rows: g1 (soon played) must survive, g2 (future) must change.
+    existing = pd.read_csv(out)
+    existing.loc[existing["game_id"] == "g1", "lh"] = 999.0
+    existing.loc[existing["game_id"] == "g2", "lh"] = 999.0
+    existing.to_csv(out, index=False)
+
+    results_csv = tmp_path / "results.csv"
+    _results_frame(["g1"]).to_csv(results_csv, index=False)
+
+    merged = simulate.simulate_games_from_odds(
+        str(odds_csv),
+        output_csv_path=str(out),
+        results_csv_path=str(results_csv),
+    ).set_index("game_id")
+
+    assert merged.loc["g1", "lh"] == 999.0
+    assert merged.loc["g2", "lh"] != 999.0
+
+
+def test_simulate_merge_preserves_manual_rows_not_in_odds(tmp_path) -> None:
+    """A hand-added row whose game_id is absent from the odds CSV is kept."""
+    odds_csv = tmp_path / "odds.csv"
+    _two_row_odds_frame().to_csv(odds_csv, index=False)
+    out = tmp_path / "out.csv"
+
+    simulate.simulate_games_from_odds(str(odds_csv), output_csv_path=str(out))
+
+    existing = pd.read_csv(out)
+    manual = existing.iloc[[0]].copy()
+    manual["game_id"] = "manual1"
+    manual["home_team"] = "Manual"
+    manual["away_team"] = "Game"
+    pd.concat([existing, manual], ignore_index=True).to_csv(out, index=False)
+
+    merged = simulate.simulate_games_from_odds(str(odds_csv), output_csv_path=str(out))
+
+    assert "manual1" in set(merged["game_id"])
+
+
 def test_simulate_games_from_odds_is_deterministic(tmp_path) -> None:
     """The analytic summary is deterministic: two runs produce identical results."""
     odds_csv = tmp_path / "odds.csv"

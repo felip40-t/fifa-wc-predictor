@@ -181,6 +181,43 @@ def _frame(*rows: dict) -> pd.DataFrame:
     return fetch_results._build_results_frame(list(rows))
 
 
+def test_build_results_frame_derives_winner_from_decisive_score():
+    """A decided game gets its winner filled in automatically."""
+    df = _frame(_result_row("g", "2026-06-29T19:00:00Z", home_score=2, away_score=1))
+
+    assert df.iloc[0]["winner"] == "Home"
+
+
+def test_build_results_frame_leaves_winner_blank_on_draw():
+    """A level score has no derivable winner (extra time/penalties decide it)."""
+    df = _frame(_result_row("g", "2026-06-29T19:00:00Z", home_score=1, away_score=1))
+
+    assert pd.isna(df.iloc[0]["winner"])
+
+
+def test_build_results_frame_preserves_existing_winner():
+    """A manually recorded shootout winner survives a frame rebuild."""
+    row = _result_row("g", "2026-06-29T19:00:00Z", home_score=1, away_score=1)
+    row["winner"] = "Away"
+
+    df = _frame(row)
+
+    assert df.iloc[0]["winner"] == "Away"
+
+
+def test_merge_results_preserves_manual_winner_for_level_game():
+    """A fetch can't know the shootout winner; an entered one must not be wiped."""
+    manual = _result_row("ko", "2026-06-29T19:00:00Z", home_score=1, away_score=1)
+    manual["winner"] = "Away"
+    existing = _frame(manual)
+    # The /scores re-fetch reports the same level game with no winner.
+    new = _frame(_result_row("ko", "2026-06-29T19:00:00Z", home_score=1, away_score=1))
+
+    merged = fetch_results.merge_results(existing, new)
+
+    assert merged.iloc[0]["winner"] == "Away"
+
+
 def test_merge_results_accumulates_new_games():
     existing = _frame(_result_row("g1", "2026-06-11T19:00:00Z"))
     new = _frame(_result_row("g2", "2026-06-12T19:00:00Z"))
@@ -230,3 +267,14 @@ def test_load_results_round_trips_saved_results(tmp_path):
     assert str(df["commence_time"].dt.tz) == "UTC"
     assert int(df.iloc[0]["home_score"]) == 3
     assert int(df.iloc[0]["away_score"]) == 2
+
+
+def test_load_results_round_trips_winner(tmp_path):
+    path = tmp_path / "results.csv"
+    row = _result_row("ko", "2026-06-29T19:00:00Z", home_score=1, away_score=1)
+    row["winner"] = "Away"
+    fetch_results.save_results(_frame(row), path)
+
+    df = fetch_results.load_results(path)
+
+    assert df.iloc[0]["winner"] == "Away"

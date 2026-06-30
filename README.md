@@ -27,6 +27,16 @@ The working pipeline turns bookmaker odds into simulated match outcomes:
    probabilities and most likely scorelines directly off it (exact, no
    sampling), plus two point estimates: a result-consistent most likely score
    and an expected rounded-goal-rate score.
+4. **Resolve the knockout bracket** (`fifa_predictor.model.standings` +
+   `knockout`): combines actual group-stage results with the headline
+   predictions for games not yet played, builds the twelve group tables under
+   FIFA tiebreakers, ranks the best eight third-placed teams, and fills the
+   predetermined Round of 32 from `data/reference/knockout_bracket.json` (whose
+   495-row table maps which third-placed group feeds which match). Once a Round
+   of 32 game has been played, its actual score advances the winner: a decisive
+   score picks the higher scorer, and a draw decided in extra time or on
+   penalties reads the advancing team from the results CSV. Rounds past the
+   Round of 32 are not resolved yet.
 
 ### Implementation status
 
@@ -37,9 +47,11 @@ The working pipeline turns bookmaker odds into simulated match outcomes:
 | Per-game outcome summary (`simulate_games_from_odds`) | Implemented |
 | Completed-game score fetching (`fetch_results.fetch_scores`) | Implemented |
 | Prediction vs actual comparison (`utils.compare`) | Implemented |
+| Group standings + Round of 32 allocation (`model.standings`, `model.knockout`) | Implemented |
+| Round of 32 result resolution (winners advanced from actual scores) | Implemented |
 | Historical results & Elo fetching (`fetch_results` year-range, `fetch_elo`) | Stub |
 | Standalone Dixon-Coles MLE fit (`dixon_coles.py`) | Stub |
-| Full tournament bracket (`simulate_tournament`) | Stub |
+| Knockout resolution past the Round of 32 / match simulation (`simulate_tournament`) | Stub |
 
 ## Installation
 
@@ -80,7 +92,11 @@ make simulate COMP=world_cup_2026
 ```
 
 The per-game summary is read exactly off the Dixon-Coles matrix, so it is
-analytic and deterministic with nothing to sample or seed.
+analytic and deterministic with nothing to sample or seed. Games the books have
+not priced (e.g. knockout matchups) are skipped rather than failing the solve,
+and games already played are skipped too. Each run merges into the existing
+summary CSV, keeping played games and any hand-added rows that are not in the
+current odds file.
 
 Each output row carries the implied goal rates (`lh`, `la`), the fitted
 Dixon-Coles correlation (`rho`), the fit quality (`residual_norm`), the outcome
@@ -134,6 +150,12 @@ accumulated: each run upserts freshly completed games onto the stored file
 (keyed by `game_id`), and older games persist. Run it periodically through the
 tournament.
 
+The results file carries a `winner` column for knockout games. A decisive score
+fills it automatically; a knockout draw decided in extra time or on penalties
+leaves it blank for you to enter the advancing team by hand, and that value is
+preserved across later fetches. Group games and decisive games can stay blank
+(the winner is read from the score).
+
 Then print predictions next to actual results for every played game:
 
 ```
@@ -153,6 +175,43 @@ The footer counts exact, result, and top-3 hits out of the games played. The
 predicted scoreline is the same headline `make predict` publishes. `make compare`
 also writes `data/processed/comparison_world_cup_2026.csv`. Set the competition
 with `COMP`.
+
+### Knockout stage
+
+Resolve the group standings and fill the Round of 32 from the saved results and
+predictions (so run `make predict` first):
+
+```
+make knockout
+```
+
+This uses actual results where games have been played and the headline
+predictions for the rest, builds the twelve group tables under FIFA tiebreakers
+(points, goal difference, goals for, then head-to-head, then a deterministic
+fallback in place of drawing lots), ranks the best eight third-placed teams, and
+fills the predetermined bracket. Played Round of 32 games are resolved to a
+winner from their actual score; a draw decided in extra time or on penalties
+needs its `winner` recorded in the results CSV, and `make knockout` stops with a
+clear error if a played draw has none. It writes
+`data/processed/group_standings_world_cup_2026.csv` and
+`data/processed/knockout_bracket_resolved_world_cup_2026.json`. The group draw
+lives in `data/reference/groups_world_cup_2026.json` and the bracket structure
+plus its 495-row third-place allocation table in
+`data/reference/knockout_bracket.json`. Re-run as results come in; a slot reads
+`projected` until its group finishes, then `final`. Set the competition with
+`COMP`.
+
+Pretty-print either output:
+
+```
+make standings   # group tables, one block per group, with the qualification cut marked
+make bracket     # the full knockout tree, R32 teams feeding through to the final
+```
+
+Each column header names the round its teams are in, from `R32` (the matchups)
+through to `CHAMPION`. A Round of 32 match that has been played shows the team
+that advanced; matches still to be decided, and every round past the Round of
+32, show a `W##` (winner of match ##) placeholder.
 
 For more control, call the function directly to set the `rho` starting guess
 (the Dixon-Coles correlation is fitted per game, seeded from this value) or
@@ -192,13 +251,15 @@ make clean    # remove __pycache__ and .pytest_cache
 src/fifa_predictor/
 ├── data/      fetch_odds.py, fetch_results.py  (fetch_elo.py: stub;
 │              fetch_results year-range path: stub)
-├── model/     vig_removal.py, poisson_inversion.py, simulate.py
+├── model/     vig_removal.py, poisson_inversion.py, simulate.py,
+│              standings.py, knockout.py
 │              (dixon_coles.py: stub; simulate.simulate_tournament: stub)
 └── utils/     logging_config.py, display.py, compare.py
 ```
 
-Raw odds and fetched results land in `data/raw/`; simulation, prediction, and
-comparison output go to `data/processed/`.
+Raw odds and fetched results land in `data/raw/`; the group draw and the
+predetermined bracket live in `data/reference/`; simulation, prediction,
+comparison, standings, and resolved-bracket output go to `data/processed/`.
 
 See `.claude/CLAUDE.md` for project conventions and constraints.
 

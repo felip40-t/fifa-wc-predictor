@@ -91,6 +91,27 @@ def test_format_hides_the_game_id_hash() -> None:
     assert "abc123hashvalue" not in out
 
 
+def _two_game_frame() -> pd.DataFrame:
+    """A two-row frame for testing the played-game filter (distinct game_ids)."""
+    frame = pd.concat([_frame(), _frame()], ignore_index=True)
+    frame.loc[1, "game_id"] = "def456"
+    frame.loc[1, "home_team"] = "Brazil"
+    frame.loc[1, "away_team"] = "Croatia"
+    return frame
+
+
+def test_format_hides_played_games() -> None:
+    out = format_simulated_outcomes(_two_game_frame(), played_ids={"abc123hashvalue"})
+    assert "Mexico vs South Africa" not in out
+    assert "Brazil vs Croatia" in out
+
+
+def test_format_without_played_ids_shows_all_games() -> None:
+    out = format_simulated_outcomes(_two_game_frame())
+    assert "Mexico vs South Africa" in out
+    assert "Brazil vs Croatia" in out
+
+
 def test_poor_fit_rows_are_flagged() -> None:
     df = _frame()
     df.loc[0, "residual_norm"] = POOR_FIT_THRESHOLD + 1
@@ -155,6 +176,35 @@ def test_format_bracket_marks_projected_slots() -> None:
     out = format_bracket(_resolved_from_structure(projected_first=True), load_bracket())
     assert "*" in out
     assert "not yet locked" in out
+
+
+def test_format_bracket_round_labels_sit_over_the_round_they_name() -> None:
+    """A team's column header is the round it is IN, not the round it won.
+
+    The leaf teams played the Round of 32, so 'R32' labels the team column; the
+    winner that emerged has reached the Round of 16, so 'R16' sits over the
+    winner column.
+    """
+    out = format_bracket(_resolved_from_structure(), load_bracket())
+    lines = out.splitlines()
+    header = lines[0]
+    winner_line = next(line for line in lines if "W73" in line)
+
+    assert header.index("R16") == winner_line.index("W73")  # R16 over R32 winners
+    assert header.index("R32") < header.index("R16")  # R32 labels the team column
+    assert "CHAMPION" in header  # the final's winner column is labelled
+
+
+def test_format_bracket_shows_advanced_team_for_decided_r32_match() -> None:
+    resolved = _resolved_from_structure()
+    resolved["round_of_32"][0]["winner"] = "Canada"  # match 73 decided
+    resolved["round_of_32"][0]["result_status"] = "played"
+
+    out = format_bracket(resolved, load_bracket())
+
+    assert "Canada" in out  # advancing team shown in the winner column
+    assert "W73" not in out  # its abstract winner token is replaced
+    assert "W74" in out  # an undecided R32 winner stays abstract
 
 
 def test_reads_from_a_csv_path(tmp_path) -> None:

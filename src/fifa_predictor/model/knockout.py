@@ -41,10 +41,12 @@ def resolve_group_games(
 ) -> list[Game]:
     """Build the 72 group games, preferring actual results over predicted fills.
 
-    The predictions frame ('match', 'score') is the complete fixture list. For
-    each fixture we use the actual score from `results` when that (home, away)
-    game has been played, else the predicted score. Each game is tagged with its
-    group and a source of 'actual' or 'predicted'.
+    The predictions frame ('match', 'score') may carry knockout-stage rows in
+    addition to the group fixtures, so we keep only the same-group pairings: a
+    fixture whose two teams sit in different groups is a knockout prediction and
+    is skipped. For each group fixture we use the actual score from `results`
+    when that (home, away) game has been played, else the predicted score. Each
+    game is tagged with its group and a source of 'actual' or 'predicted'.
     """
     team_group = {t: letter for letter, teams in groups.items() for t in teams}
     actual = {
@@ -53,11 +55,14 @@ def resolve_group_games(
         if pd.notna(r.home_score) and pd.notna(r.away_score)
     }
     games: list[Game] = []
+    skipped = 0
     for row in predictions.itertuples():
         home, away = _parse_match(row.match)
         grp = team_group[home]
         if team_group[away] != grp:
-            raise ValueError(f"cross-group fixture: {home} ({grp}) vs {away} ({team_group[away]})")
+            # Cross-group pairing -> knockout-stage prediction, not a group game.
+            skipped += 1
+            continue
         if (home, away) in actual:
             hs, as_ = actual[(home, away)]
             source = "actual"
@@ -65,7 +70,67 @@ def resolve_group_games(
             hs, as_ = (int(x) for x in str(row.score).split("-"))
             source = "predicted"
         games.append(Game(home, away, hs, as_, grp, source))
+    if skipped:
+        logger.info("Skipped %d non-group (knockout) prediction rows", skipped)
     return games
+
+
+def _decide_winner(home: str, away: str, hs: int, as_: int, winner_cell: str | None) -> str:
+    """Resolve the advancing team for one played knockout match.
+
+    A decisive score advances the higher scorer; a `winner_cell` that contradicts
+    the score is an error. A level score (the only outcome that goes to extra time
+    or penalties) must name the advancing team in `winner_cell`, which has to be
+    one of the two teams.
+    """
+    match = f"{home} {hs}-{as_} {away}"
+    if hs != as_:
+        scored = home if hs > as_ else away
+        if winner_cell and winner_cell != scored:
+            raise ValueError(
+                f"winner '{winner_cell}' contradicts decisive score for {match}"
+            )
+        return scored
+    if not winner_cell:
+        raise ValueError(f"level knockout match needs a recorded winner: {match}")
+    if winner_cell not in (home, away):
+        raise ValueError(f"winner '{winner_cell}' is not in match {match}")
+    return winner_cell
+
+
+def attach_r32_results(r32: list[dict], results: pd.DataFrame) -> list[dict]:
+    """Fill each resolved Round of 32 slot with its actual result, when played.
+
+    Slots are matched to result rows by (home, away) team pairing. A matched slot
+    gains `home_score`, `away_score`, `winner`, and `result_status` of 'played';
+    an unmatched slot gets `result_status` of 'scheduled' and no score. Winners
+    come from the score, except a level (extra time / penalties) match whose
+    advancing team is read from the optional `winner` column.
+    """
+    has_winner_col = "winner" in results.columns
+    played = {}
+    for r in results.itertuples():
+        if pd.isna(r.home_score) or pd.isna(r.away_score):
+            continue
+        winner_cell = getattr(r, "winner", None) if has_winner_col else None
+        if winner_cell is not None and (pd.isna(winner_cell) or str(winner_cell).strip() == ""):
+            winner_cell = None
+        played[(r.home_team, r.away_team)] = (int(r.home_score), int(r.away_score), winner_cell)
+
+    resolved: list[dict] = []
+    for slot in r32:
+        out = dict(slot)
+        key = (slot["home"], slot["away"])
+        if key in played:
+            hs, as_, winner_cell = played[key]
+            out["home_score"] = hs
+            out["away_score"] = as_
+            out["winner"] = _decide_winner(slot["home"], slot["away"], hs, as_, winner_cell)
+            out["result_status"] = "played"
+        else:
+            out["result_status"] = "scheduled"
+        resolved.append(out)
+    return resolved
 
 
 def _group_complete(tables: dict[str, list[TeamStanding]], games: list[Game]) -> dict[str, bool]:
@@ -159,6 +224,9 @@ def main() -> None:
     tables = build_group_tables(games, groups)
     thirds = rank_third_placed(tables)
     r32 = resolve_round_of_32(tables, thirds, bracket, games)
+    r32 = attach_r32_results(r32, results)
+    n_played = sum(m["result_status"] == "played" for m in r32)
+    logger.info("Filled %d of %d Round of 32 matches from results", n_played, len(r32))
 
     standings_path = Path(f"data/processed/group_standings_{comp}.csv")
     standings_path.parent.mkdir(parents=True, exist_ok=True)
